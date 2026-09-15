@@ -10593,7 +10593,10 @@ static int magic2_create(const magic2_adaptive_config *config, magic2_adaptive_c
 
 static int magic2_internal_run_acquired(magic2_adaptive_context *context, const magic2_call *call,
                         int *implementation_status) {
-    struct magic2_internal_signature signature;
+    struct magic2_internal_signature signature = {
+        { 0u, 0u }, { 0u, 0u }, { 0u, 0u },
+        0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+    };
     struct magic2_internal_profile *profile = NULL;
     size_t profile_index = 0u;
     size_t output_bytes = 0u;
@@ -10707,7 +10710,10 @@ static int magic2_query(magic2_adaptive_context *context, const magic2_call *cal
                           magic2_stats *stats) {
     const size_t stats_min_size = offsetof(magic2_stats, selected_name) +
                                   sizeof(stats->selected_name);
-    struct magic2_internal_signature signature;
+    struct magic2_internal_signature signature = {
+        { 0u, 0u }, { 0u, 0u }, { 0u, 0u },
+        0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+    };
     struct magic2_internal_profile *profile = NULL;
     size_t profile_index = 0u;
     size_t output_bytes = 0u;
@@ -10900,7 +10906,10 @@ static int magic2_internal_resolve_acquired(magic2_adaptive_context *context, co
                             magic2_selected_plan *plan) {
     const size_t plan_min_size = offsetof(magic2_selected_plan, candidate_user) +
                                  sizeof(plan->candidate_user);
-    struct magic2_internal_signature signature;
+    struct magic2_internal_signature signature = {
+        { 0u, 0u }, { 0u, 0u }, { 0u, 0u },
+        0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+    };
     struct magic2_internal_profile *profile = NULL;
     size_t profile_index = 0u;
     size_t output_bytes = 0u;
@@ -10963,7 +10972,10 @@ static int magic2_plan_run(magic2_adaptive_context *context, magic2_selected_pla
 
     const size_t plan_min_size = offsetof(magic2_selected_plan, candidate_user) +
                                  sizeof(plan->candidate_user);
-    struct magic2_internal_signature signature;
+    struct magic2_internal_signature signature = {
+        { 0u, 0u }, { 0u, 0u }, { 0u, 0u },
+        0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+    };
     struct magic2_internal_profile *profile = NULL;
     size_t output_bytes = 0u;
     uint32_t selected_index = 0u;
@@ -15603,10 +15615,10 @@ static int magic2_buffer_context_run(
     const size_t status_min_size = offsetof(magic2_run_status,
         implementation_status) + sizeof(status->implementation_status);
     struct magic2_internal_buffers_session *session = NULL;
-    const struct magic2_internal_buffers_packet_header *header;
-    const struct magic2_internal_buffers_packet_entry *entries;
-    const unsigned char *payload;
-    magic2_call adaptive_call;
+    const struct magic2_internal_buffers_packet_header *header = NULL;
+    const struct magic2_internal_buffers_packet_entry *entries = NULL;
+    const unsigned char *payload = NULL;
+    magic2_call adaptive_call = MAGIC2_CALL_INIT;
     magic2_stats stats = MAGIC2_STATS_INIT;
     int implementation_status = 0;
     int result;
@@ -15633,7 +15645,7 @@ static int magic2_buffer_context_run(
             adaptive_call.input_bytes, &header, &entries, &payload);
         (void)payload;
     }
-    if (result == MAGIC2_OK) {
+    if (result == MAGIC2_OK && header != NULL && entries != NULL && payload != NULL) {
         for (index = 0u; index < header->buffer_count; ++index) {
             if ((entries[index].access & MAGIC2_BUFFER_WRITE) != 0u) {
                 memmove(call->buffers[index].data,
@@ -15652,6 +15664,8 @@ static int magic2_buffer_context_run(
                 result = query_result;
             }
         }
+    } else if (result == MAGIC2_OK) {
+        result = MAGIC2_ECONTRACT;
     }
     magic2_internal_buffers_release_session(session);
     magic2_internal_buffers_context_release(context);
