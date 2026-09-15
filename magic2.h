@@ -8143,8 +8143,13 @@ static inline int64_t magic2_internal_saturating_difference_u64(
 static inline void magic2_internal_summarize_paired(
     const uint64_t *baseline, const uint64_t *candidate, uint32_t count,
     int64_t *median_improvement, uint64_t *mad) {
-    int64_t differences[MAGIC2_INTERNAL_MAX_SAMPLES];
-    uint64_t deviations[MAGIC2_INTERNAL_MAX_SAMPLES];
+    /* Keep the scratch arrays deterministically initialized.  Some GCC
+     * MinGW optimizers cannot prove that the bounded sort fills every element
+     * read below, even though the count contract guarantees it.  This path is
+     * control-plane statistics, so the tiny initialization cost is irrelevant
+     * to native execution hot paths and keeps strict -Werror builds portable. */
+    int64_t differences[MAGIC2_INTERNAL_MAX_SAMPLES] = { 0 };
+    uint64_t deviations[MAGIC2_INTERNAL_MAX_SAMPLES] = { 0 };
     uint32_t i;
     if (count == 0u) {
         *median_improvement = 0;

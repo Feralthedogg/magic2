@@ -24,8 +24,8 @@ jobs:
         env:
           CC: ${{ matrix.compiler }}
         run: |
-          "$CC" -std=c11 -O1 -g -Wall -Wextra -Werror -pthread \
-            -fsanitize=address,undefined example.c -o example
+          "$CC" -std=c11 -O1 -g -Wall -Wextra -Werror -pthread -I. \
+            -fsanitize=address,undefined examples/example.c -o example
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
             UBSAN_OPTIONS=halt_on_error=1 ./example
       - name: Build and run CPU and graph tests
@@ -37,7 +37,7 @@ jobs:
             "$CC" -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-function \
               -pthread -fsanitize=address,undefined "$source" -o "$name"
             ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
-              UBSAN_OPTIONS=halt_on_error=1 ./$name
+              UBSAN_OPTIONS=halt_on_error=1 ./"$name"
           done
       - name: Build and run C++17 CPU and graph tests
         env:
@@ -48,7 +48,7 @@ jobs:
             "$CXX" -x c++ -std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-unused-function \
               -pthread -fsanitize=address,undefined "$source" -o "$name"
             ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
-              UBSAN_OPTIONS=halt_on_error=1 ./$name
+              UBSAN_OPTIONS=halt_on_error=1 ./"$name"
           done
       - name: Separate implementation linkage
         env:
@@ -71,11 +71,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install MinGW-w64
-        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
       - name: Cross-build x86-64 Windows example and client
         run: |
-          x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror \
-            example.c -static -static-libgcc -o example.exe
+          x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -I. \
+            examples/example.c -static -static-libgcc -o example.exe
           x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror \
             -c magic2_impl.c -o magic2_impl.o
           x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -86,10 +86,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Build and run MSVC example
         shell: cmd
         run: |
-          cl /nologo /std:c11 /TC /W4 /WX /O2 /I. example.c /Fe:example-msvc.exe
+          cl /nologo /std:c11 /TC /W4 /WX /O2 /I. examples\example.c /Fe:example-msvc.exe
           example-msvc.exe
       - name: Build and run MSVC public client
         shell: cmd

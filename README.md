@@ -1,34 +1,39 @@
 # magic2
 
 <p align="center">
-  <img src="./magic2_logo.png" alt="magic2 logo" width="560">
+  <img src="./image/magic2_logo.png" alt="magic2 logo" width="560">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 ![C](https://img.shields.io/badge/language-C11-informational)
 ![C++](https://img.shields.io/badge/C%2B%2B-C%2B%2B17-informational)
-![Target](https://img.shields.io/badge/target-x86--64-brightgreen)
+![Targets](https://img.shields.io/badge/targets-multi--architecture-brightgreen)
 ![Runtime](https://img.shields.io/badge/runtime-CPU--only-orange)
 ![Header](https://img.shields.io/badge/distribution-single--header-lightgrey)
 
-**magic2** is a CPU-only adaptive native execution runtime for x86-64 Linux and
-Windows. It began as a fast native implementation selector and now represents
-the complete execution choice: implementation, ISA, worker budget, tile size,
-scheduling policy, memory placement, and graph concurrency.
+**magic2** is a CPU-only adaptive native execution runtime for C11 and C++17 on
+Unix-like systems and Windows. x86-64 is the primary CI and benchmark target,
+not an architectural limit: the header also recognizes x86, ARM/ARM64, PowerPC,
+and RISC-V targets and selects the feature gates that are legal on each one. It
+began as a fast native implementation selector and now represents the complete
+execution choice: implementation, ISA, worker budget, tile size, scheduling
+policy, memory placement, and graph concurrency.
 
 The runtime keeps a small family of immutable execution plans and chooses among
 them from measured workload and resource context. A prepared plan can be sealed
 and reused on the data path, while exploration and profile updates stay on the
 control path.
 
+> [!NOTE]
+> x86-64 is the best-covered release target because it is the architecture used
+> by the hosted CI runners. The public contract is broader; the same header
+> carries architecture-specific feature detection and a scalar fallback for the
+> other families listed below.
+
 > [!IMPORTANT]
 > magic2 never guesses that an opaque C callback is safe to partition. A kernel
 > must declare its shape, access, alias, tail, scratch, reduction, and failure
 > contract before the runtime can execute it as tiles or graph nodes.
-
-> [!NOTE]
-> The repository is CPU-only. GPU backends and LLAM integration are deliberately
-> outside this project. The public artifact is `magic2.h`.
 
 ---
 
@@ -56,6 +61,42 @@ magic2 makes those choices explicit and measurable:
 Always benchmark the workload that matters. A larger worker count is not assumed
 to be faster, and a remote profile is treated as evidence rather than proof of
 local legality or performance.
+
+## Supported targets
+
+The public API is architecture-neutral. Callers describe semantic work and
+buffer contracts; native bindings may require the feature set reported by the
+current execution domain.
+
+| Architecture family | Detected feature gates | Support boundary |
+|---|---|---|
+| x86 / x86-64 | SSE2, SSE4.2, AVX, FMA, AVX2, AVX-512F/BW/VL | Fully exercised by the CI matrix on x86-64 Linux and Windows toolchains |
+| ARM / ARM64 | NEON, SVE, SVE2 | Runtime detection on Linux/AArch64; scalar fallback remains available |
+| PowerPC | AltiVec, VSX | Compile-time feature detection with scalar fallback |
+| RISC-V | Vector extension | Compile-time vector-width reporting where the toolchain exposes it |
+| Other C11 targets | Generic scalar path (`MAGIC2_ARCH_UNKNOWN`) | Plan and profile APIs remain portable; threaded execution needs a supported OS backend |
+
+The CI workflow intentionally covers the readily available x86-64 runners and
+cross-compilers. That coverage should not be read as an x86-64-only contract;
+additional architecture runners can exercise the same header without changing
+the public model.
+
+> [!TIP]
+> Register a legal scalar or baseline plan before adding ISA-specific plans to a
+> family. The runtime can then fall back safely when a feature gate or execution
+> domain does not match the host.
+
+## Repository layout
+
+```text
+magic2/
+├── magic2.h                    # public single-header runtime
+├── magic2_impl.c               # optional separate implementation TU
+├── examples/example.c          # minimal C11 executable example
+├── tests/                      # C11/C++17 runtime and graph checks
+├── image/magic2_logo.png       # project artwork
+└── .github/workflows/ci.yml    # sanitizer, cross-build, and MSVC CI
+```
 
 ## Execution model
 
@@ -99,6 +140,11 @@ or workspace layout.
 a worker limit, a schedule, CPU feature requirements, and per-slot scratch.
 The callback receives a half-open logical range `[begin, end)`, bound ports, a
 slot number, and scratch that is exclusive to that slot for the callback.
+
+> [!IMPORTANT]
+> A plan's feature requirements are checked against every worker in its
+> execution domain. Do not publish an AVX, NEON, SVE, or other specialized plan
+> unless its callback and required features are valid for the complete domain.
 
 | Schedule | Behavior | Typical use |
 |---|---|---|
@@ -286,10 +332,10 @@ The header is usable from C11 and C++17. The built-in executor uses the platform
 thread implementation only when its implementation translation unit is compiled.
 
 ```sh
-# Linux / macOS / other Unix-like hosts
+# Linux / macOS / other Unix-like hosts (any supported architecture)
 clang -std=c11 -O2 -pthread -c impl.c -o magic2-runtime.o
 
-# MinGW-w64 x86-64 cross-build
+# MinGW-w64 x86-64 cross-build (the CI Windows cross-build)
 x86_64-w64-mingw32-gcc -std=c11 -O2 -c impl.c -o magic2-runtime.o
 
 # MSVC Developer Command Prompt (C11 mode)
@@ -300,13 +346,22 @@ The full source-only validation kit is available as `outputs/magic2.zip` in the
 development workspace; the repository itself contains the header, examples,
 tests, and CI workflow needed to build the runtime directly.
 
+> [!TIP]
+> When compiling an example from the `examples/` directory, keep the repository
+> root on the include path (`-I.` or `/I.`) so it can include `magic2.h`.
+
 ## CI
 
 Every push to `main` and every pull request runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
-The workflow builds and runs the example and CPU/graph tests with Clang and GCC
+The workflow builds and runs [`examples/example.c`](./examples/example.c) and CPU/graph tests with Clang and GCC
 under C11 and C++17 AddressSanitizer/UndefinedBehaviorSanitizer, checks separate
 implementation linkage, cross-builds MinGW-w64 x86-64 Windows artifacts, and
 runs the example plus public client with MSVC on `windows-latest`.
+
+> [!WARNING]
+> CI proves compilation, API behavior, sanitizer cleanliness, and selected
+> cross-target linkage. It does not turn one runner's timing into a portable
+> performance guarantee; tune again on the deployment hardware and workload.
 
 ## Verification and measured behavior
 
