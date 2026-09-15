@@ -9409,14 +9409,14 @@ magic2_internal_tune_finish:
     if (!tuning_committed) {
         magic2_internal_profile_write_begin(profile);
         if (MAGIC2_INTERNAL_LOAD32(&profile->state) == MAGIC2_PROFILE_TUNING) {
-            uint32_t current_plus_one =
+            uint32_t restore_plus_one =
                 MAGIC2_INTERNAL_LOAD32(&profile->selected_plus_one);
-            uint32_t current_index = current_plus_one != 0u ?
-                current_plus_one - 1u : 0u;
+            uint32_t restore_index = restore_plus_one != 0u ?
+                restore_plus_one - 1u : 0u;
             uint64_t invalid_mask =
                 MAGIC2_INTERNAL_LOAD64(&profile->invalid_mask);
-            if (current_index != 0u && current_index < 64u &&
-                (invalid_mask & (UINT64_C(1) << current_index)) != 0u) {
+            if (restore_index != 0u && restore_index < 64u &&
+                (invalid_mask & (UINT64_C(1) << restore_index)) != 0u) {
                 MAGIC2_INTERNAL_STORE32(&profile->selected_plus_one, 1u);
                 MAGIC2_INTERNAL_STORE32(&profile->state,
                                        MAGIC2_PROFILE_QUARANTINED);
@@ -9424,7 +9424,7 @@ magic2_internal_tune_finish:
             } else {
                 uint32_t restore_state = start_state;
                 if (restore_state == MAGIC2_PROFILE_TUNING) {
-                    restore_state = current_index != 0u ?
+                    restore_state = restore_index != 0u ?
                         MAGIC2_PROFILE_READY : MAGIC2_PROFILE_BASELINE;
                 }
                 MAGIC2_INTERNAL_STORE32(&profile->state, restore_state);
@@ -9630,11 +9630,11 @@ static int magic2_internal_execute_profile(
                             &context->candidates[selected_index])) {
                         int delivery_status = 0;
                         int delivery_result;
-                        int delivered_candidate = 0;
+                        int delivery_delivered_candidate = 0;
                         delivery_result = magic2_internal_invoke_profile_delivery(
                             context, profile, selected_index, generation,
                             call, output_bytes, session, 1, &delivery_status,
-                            &delivered_candidate);
+                            &delivery_delivered_candidate);
                         magic2_internal_session_release(session);
                         if (implementation_status != NULL)
                             *implementation_status = delivery_status;
@@ -24398,7 +24398,7 @@ MAGIC2_API int magic2_cpu_family_profile_import(
     magic2_cpu_family *family, const void *buffer, size_t size,
     uint32_t weight_permille, magic2_cpu_profile_import_result *out_result) {
     unsigned char *copy = NULL;
-    uint64_t *incoming_weight = NULL;
+    uint32_t *incoming_weight = NULL;
     uint64_t *incoming_ewma = NULL;
     unsigned char *seen = NULL;
     size_t evidence_count;
@@ -24465,7 +24465,7 @@ MAGIC2_API int magic2_cpu_family_profile_import(
         goto magic2_cpu_profile_import_done;
     }
     evidence_count = (size_t)family->plan_count * family->bucket_count;
-    incoming_weight = (uint64_t *)calloc(
+    incoming_weight = (uint32_t *)calloc(
         evidence_count, sizeof(*incoming_weight));
     incoming_ewma = (uint64_t *)calloc(
         evidence_count, sizeof(*incoming_ewma));
@@ -24494,7 +24494,7 @@ MAGIC2_API int magic2_cpu_family_profile_import(
             magic2_internal_cpu_profile_get64(record + 40u);
         uint32_t plan_index;
         uint64_t bounded;
-        uint64_t weight;
+        uint32_t weight;
         size_t destination;
         if (reserved != 0u || bucket >= family->bucket_count) {
             result = MAGIC2_EPROFILE;
@@ -24516,7 +24516,7 @@ MAGIC2_API int magic2_cpu_family_profile_import(
         seen[destination] = 1u;
         bounded = samples < family->import_sample_cap ?
             samples : family->import_sample_cap;
-        weight = bounded * weight_permille / 1000u;
+        weight = (uint32_t)((bounded * (uint64_t)weight_permille) / 1000u);
         if (weight == 0u) weight = 1u;
         incoming_weight[destination] = weight;
         incoming_ewma[destination] = ewma;
@@ -24530,7 +24530,7 @@ MAGIC2_API int magic2_cpu_family_profile_import(
     }
     for (record_index = 0u; record_index < evidence_count; ++record_index) {
         struct magic2_internal_cpu_evidence *evidence;
-        uint64_t weight = incoming_weight[record_index];
+        uint32_t weight = incoming_weight[record_index];
         uint64_t old_samples;
         uint64_t total;
         if (weight == 0u) continue;
