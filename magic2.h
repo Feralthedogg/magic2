@@ -802,6 +802,16 @@ typedef int (*magic2_adaptive_buffer_eligible_fn)(
     void *candidate_user
 );
 
+/**
+ * @brief Start one asynchronous buffer operation.
+ *
+ * @details
+ * On success, a PENDING state must be paired with a non-NULL operation_user
+ * handle. A callback that returns an error and does not create an operation
+ * may leave operation_user NULL; magic2 will then skip cancel, wait, and
+ * release callbacks because there is no backend handle to clean up. If work
+ * was started, the callback must return a handle that those callbacks accept.
+ */
 typedef int (*magic2_async_submit_fn)(
     magic2_buffer_desc *buffers,
     size_t buffer_count,
@@ -813,6 +823,7 @@ typedef int (*magic2_async_submit_fn)(
     int *implementation_status
 );
 
+/** @brief Poll a non-NULL handle returned by ::magic2_async_submit_fn. */
 typedef int (*magic2_async_poll_fn)(
     void *operation_user,
     uint32_t *state,
@@ -820,6 +831,7 @@ typedef int (*magic2_async_poll_fn)(
     void *candidate_user
 );
 
+/** @brief Wait on a non-NULL handle returned by ::magic2_async_submit_fn. */
 typedef int (*magic2_async_wait_fn)(
     void *operation_user,
     uint64_t timeout_ns,
@@ -828,11 +840,13 @@ typedef int (*magic2_async_wait_fn)(
     void *candidate_user
 );
 
+/** @brief Cancel a non-NULL handle returned by ::magic2_async_submit_fn. */
 typedef int (*magic2_async_cancel_fn)(
     void *operation_user,
     void *candidate_user
 );
 
+/** @brief Release a non-NULL handle returned by ::magic2_async_submit_fn. */
 typedef void (*magic2_async_release_fn)(
     void *operation_user,
     void *candidate_user
@@ -15797,6 +15811,7 @@ static uint32_t magic2_internal_async_reap_quarantined(
         if (MAGIC2_INTERNAL_LOAD32(&slot->occupied) != 0u &&
             MAGIC2_INTERNAL_LOAD32(&slot->quarantined) != 0u &&
             slot->async_backend != 0u &&
+            slot->operation_user != NULL &&
             slot->selected_index < context->candidate_count) {
             const magic2_adaptive_buffer_candidate *candidate =
                 &context->candidates[slot->selected_index];
@@ -15946,6 +15961,8 @@ static int magic2_internal_async_call_poll(
     uint64_t start_time = 0u;
     uint64_t end_time = 0u;
     int callback_result;
+    if (slot->async_backend == 0u || slot->operation_user == NULL)
+        return MAGIC2_ESTATE;
     (void)magic2_internal_now_ns(context->adaptive, &start_time);
     magic2_internal_callback_enter(&frame, context->adaptive, callback_kind);
     if (callback_kind == MAGIC2_CALLBACK_ASYNC_POLL) {
@@ -15984,7 +16001,7 @@ static int magic2_internal_async_failed_submit_terminal(
     uint32_t wait_state = MAGIC2_ASYNC_PENDING;
     int wait_implementation_status = 0;
     int wait_result = MAGIC2_EIMPLEMENTATION;
-    if (slot->async_backend == 0u) return 1;
+    if (slot->async_backend == 0u || slot->operation_user == NULL) return 1;
     magic2_internal_callback_enter(&frame, context->adaptive,
                                   MAGIC2_CALLBACK_ASYNC_CANCEL);
     (void)candidate->async_ops.cancel(
@@ -16099,7 +16116,6 @@ static int magic2_buffer_async_submit(
         (void)entries;
         if (result == MAGIC2_OK) {
             memcpy(slot->scratch.output, payload, header->packed_bytes);
-            slot->async_backend = 1u;
             magic2_internal_callback_enter(&frame, context->adaptive,
                                           MAGIC2_CALLBACK_ASYNC_SUBMIT);
             callback_result = candidate->async_ops.submit(
@@ -16115,9 +16131,15 @@ static int magic2_buffer_async_submit(
             } else {
                 submit_reported_terminal =
                     magic2_internal_async_terminal(state);
+                if (state == MAGIC2_ASYNC_PENDING && operation_user == NULL)
+                    result = MAGIC2_ECONTRACT;
             }
         }
         slot->operation_user = operation_user;
+        /* A backend handle is the capability required by poll, wait, cancel,
+         * and release.  A failed submit may legitimately return no handle; in
+         * that case cleanup must not call those callbacks with NULL. */
+        slot->async_backend = operation_user != NULL ? 1u : 0u;
         slot->state = state;
         slot->implementation_status = implementation_status;
         if (state == MAGIC2_ASYNC_COMPLETE && implementation_status != 0)
@@ -16138,7 +16160,7 @@ static int magic2_buffer_async_submit(
     if (result == MAGIC2_OK)
         result = magic2_internal_async_finalize(context, slot);
     if (result != MAGIC2_OK) {
-        if (slot->async_backend != 0u) {
+        if (slot->async_backend != 0u && slot->operation_user != NULL) {
             const magic2_adaptive_buffer_candidate *candidate =
                 &context->candidates[slot->selected_index];
             if (!magic2_internal_async_failed_submit_terminal(
@@ -16184,7 +16206,8 @@ static int magic2_buffer_async_poll(
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_async_lookup_locked(context, handle, &slot);
     if (result == MAGIC2_OK && slot->state == MAGIC2_ASYNC_PENDING) {
-        if (slot->async_backend == 0u) result = MAGIC2_ESTATE;
+        if (slot->async_backend == 0u || slot->operation_user == NULL)
+            result = MAGIC2_ESTATE;
         else result = magic2_internal_async_call_poll(
             context, slot, MAGIC2_CALLBACK_ASYNC_POLL, 0u);
     }
@@ -16208,7 +16231,8 @@ static int magic2_buffer_async_wait(
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_async_lookup_locked(context, handle, &slot);
     if (result == MAGIC2_OK && slot->state == MAGIC2_ASYNC_PENDING) {
-        if (slot->async_backend == 0u) result = MAGIC2_ESTATE;
+        if (slot->async_backend == 0u || slot->operation_user == NULL)
+            result = MAGIC2_ESTATE;
         else result = magic2_internal_async_call_poll(
             context, slot, MAGIC2_CALLBACK_ASYNC_WAIT, timeout_ns);
     }
@@ -16236,7 +16260,7 @@ static int magic2_buffer_async_cancel(
             &context->candidates[slot->selected_index];
         struct magic2_internal_callback_frame frame;
         int cancel_result;
-        if (slot->async_backend == 0u) {
+        if (slot->async_backend == 0u || slot->operation_user == NULL) {
             result = MAGIC2_ESTATE;
         } else {
             magic2_internal_callback_enter(&frame, context->adaptive,
@@ -16276,7 +16300,7 @@ static int magic2_buffer_async_release(
     if (result == MAGIC2_OK) {
         const magic2_adaptive_buffer_candidate *candidate =
             &context->candidates[slot->selected_index];
-        if (slot->async_backend != 0u &&
+        if (slot->async_backend != 0u && slot->operation_user != NULL &&
             candidate->async_ops.release != NULL) {
             struct magic2_internal_callback_frame frame;
             magic2_internal_callback_enter(&frame, context->adaptive,
@@ -19515,19 +19539,23 @@ static void magic2_internal_sealed_graph_builder_cleanup(
     magic2_free_fn dealloc;
     magic2_owner allocator_owner;
     void *user;
+    void *self;
     uint32_t index;
     if (builder == NULL) return;
     dealloc = builder->dealloc;
     allocator_owner = builder->allocator_owner;
     user = builder->allocator_user;
+    self = builder->self_allocation;
     builder->cookie = 0u;
     for (index = 0u; index < builder->node_count; ++index)
         magic2_sealed_plan_release(&builder->nodes[index].plan);
     magic2_internal_sealed_graph_free(dealloc, builder->maps_allocation, user);
     magic2_internal_sealed_graph_free(dealloc, builder->nodes_allocation, user);
     magic2_internal_sealed_graph_free(dealloc, builder->regions_allocation, user);
+    magic2_internal_sealed_graph_free(dealloc, self, user);
+    /* The final self deallocation still receives allocator_user.  Keep the
+     * allocator state alive until every builder allocation has been released. */
     magic2_internal_sealed_owner_release(&allocator_owner);
-    magic2_internal_sealed_graph_free(dealloc, builder->self_allocation, user);
 }
 
 MAGIC2_API int magic2_sealed_graph_builder_create(
@@ -20657,11 +20685,15 @@ magic2_sealed_graph_compile_done:
     magic2_internal_sealed_graph_free(builder->dealloc, indegree,
                                  builder->allocator_user);
     if (graph != NULL) {
+        const magic2_free_fn graph_dealloc = graph->dealloc;
+        const magic2_owner graph_allocator_owner = graph->allocator_owner;
+        void *const graph_allocator_user = graph->allocator_user;
+        void *const graph_self_allocation = graph->self_allocation;
         graph->lease_count = retained_lease_count;
         magic2_internal_sealed_graph_release_leases(graph, retained_lease_count);
-        magic2_internal_sealed_owner_release(&graph->allocator_owner);
         magic2_internal_sealed_graph_free(
-            graph->dealloc, graph->self_allocation, graph->allocator_user);
+            graph_dealloc, graph_self_allocation, graph_allocator_user);
+        magic2_internal_sealed_owner_release(&graph_allocator_owner);
     }
     mutable_builder->compiling = 0u;
     return result;
@@ -20776,8 +20808,10 @@ static void magic2_internal_sealed_graph_final_release(
     /* Plan/environment release callbacks may reenter graph APIs.  All public
      * graph handles are cleared before this function is entered. */
     magic2_internal_sealed_graph_release_leases(graph, lease_count);
-    magic2_internal_sealed_owner_release(&allocator_owner);
     magic2_internal_sealed_graph_free(dealloc, self_allocation, allocator_user);
+    /* The deallocator may inspect allocator_user, so it must run before the
+     * graph's allocator-state owner is released. */
+    magic2_internal_sealed_owner_release(&allocator_owner);
 }
 
 MAGIC2_API void magic2_sealed_graph_release(magic2_sealed_graph **graph_pointer) {

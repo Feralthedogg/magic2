@@ -355,8 +355,9 @@ tests, and CI workflow needed to build the runtime directly.
 Every push to `main` and every pull request runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 The workflow builds and runs [`examples/example.c`](./examples/example.c) and CPU/graph tests with Clang and GCC
 under C11 and C++17 AddressSanitizer/UndefinedBehaviorSanitizer, checks separate
-implementation linkage, cross-builds MinGW-w64 x86-64 Windows artifacts, and
-runs the example plus public client with MSVC on `windows-latest`.
+implementation linkage and allocator/async lifetime regressions, cross-builds
+MinGW-w64 x86-64 Windows artifacts, and runs the example plus public client and
+security regressions with MSVC on `windows-latest`.
 
 > [!WARNING]
 > CI proves compilation, API behavior, sanitizer cleanliness, and selected

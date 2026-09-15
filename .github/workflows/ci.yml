@@ -32,7 +32,7 @@ jobs:
         env:
           CC: ${{ matrix.compiler }}
         run: |
-          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c; do
+          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c tests/test_security_lifetimes.c; do
             name=$(basename "$source" .c)
             "$CC" -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-function \
               -pthread -fsanitize=address,undefined "$source" -o "$name"
@@ -43,7 +43,7 @@ jobs:
         env:
           CXX: ${{ matrix.cxx }}
         run: |
-          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c; do
+          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c tests/test_security_lifetimes.c; do
             name=$(basename "$source" .c)-cxx
             "$CXX" -x c++ -std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-unused-function \
               -pthread -fsanitize=address,undefined "$source" -o "$name"
@@ -81,6 +81,9 @@ jobs:
           x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror \
             tests/test_public_client.c magic2_impl.o -static -static-libgcc \
             -o public-client.exe
+          x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -I. \
+            tests/test_security_lifetimes.c -static -static-libgcc \
+            -o security-lifetimes.exe
 
   windows-msvc:
     runs-on: windows-latest
@@ -98,3 +101,8 @@ jobs:
         run: |
           cl /nologo /std:c11 /TC /W4 /WX /O2 /I. magic2_impl.c tests\test_public_client.c /Fe:public-client-msvc.exe
           public-client-msvc.exe
+      - name: Build and run MSVC security regressions
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /TC /W4 /WX /O2 /I. tests\test_security_lifetimes.c /Fe:security-lifetimes-msvc.exe
+          security-lifetimes-msvc.exe
