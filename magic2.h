@@ -25096,8 +25096,16 @@ static int magic2_internal_parallel_graph_reserve(
     }
 }
 
+static uint32_t magic2_internal_parallel_graph_available_permits(
+    const struct magic2_internal_parallel_graph_run *run) {
+    const uint32_t used = MAGIC2_INTERNAL_LOAD32(&run->used_permits);
+    return used >= run->permit_limit ? 0u : run->permit_limit - used;
+}
+
 static uint32_t magic2_internal_parallel_graph_claim_ready(
     struct magic2_internal_parallel_graph_run *run, uint32_t slot) {
+    const uint32_t available =
+        magic2_internal_parallel_graph_available_permits(run);
     uint32_t step;
     for (step = 0u; step < MAGIC2_SEALED_GRAPH_STATUS_WORDS; ++step) {
         const uint32_t word_index =
@@ -25106,12 +25114,38 @@ static uint32_t magic2_internal_parallel_graph_claim_ready(
         while (current != 0u) {
             const uint32_t bit = magic2_internal_sealed_graph_ctz64(current);
             const uint64_t mask = UINT64_C(1) << bit;
-            uint64_t expected = current;
-            if (magic2_internal_cas64(
-                    &run->ready[word_index], &expected, current & ~mask)) {
-                const uint32_t node_index = word_index * 64u + bit;
-                if (node_index < run->graph->node_count) return node_index;
+            const uint32_t node_index = word_index * 64u + bit;
+            uint64_t expected;
+            uint32_t claim;
+            if (node_index >= run->graph->node_count) {
+                expected = MAGIC2_INTERNAL_LOAD64(&run->ready[word_index]);
+                if ((expected & mask) == 0u) {
+                    current = expected;
+                    continue;
+                }
+                if (magic2_internal_cas64(
+                        &run->ready[word_index], &expected, expected & ~mask))
+                    current = expected & ~mask;
+                else
+                    current = expected;
+                continue;
+            }
+            claim = run->graph->nodes[node_index].worker_claim;
+            /* Leave ready nodes whose claim cannot fit in the current
+             * permit window for a later pass, while continuing to inspect
+             * smaller ready nodes in the same word. */
+            if (claim > available) {
                 current &= ~mask;
+                continue;
+            }
+            expected = MAGIC2_INTERNAL_LOAD64(&run->ready[word_index]);
+            if ((expected & mask) == 0u) {
+                current = expected;
+                continue;
+            }
+            if (magic2_internal_cas64(
+                    &run->ready[word_index], &expected, expected & ~mask)) {
+                return node_index;
             } else {
                 current = expected;
             }
@@ -25141,6 +25175,14 @@ static void magic2_internal_parallel_graph_execute_slot(
                     &run->ready[node_index / 64u],
                     UINT64_C(1) << (node_index % 64u));
                 magic2_internal_cpu_relax();
+                if (++idle_rounds >= 1024u) {
+#if defined(_WIN32)
+                    SwitchToThread();
+#else
+                    sched_yield();
+#endif
+                    idle_rounds = 0u;
+                }
                 continue;
             }
             if (MAGIC2_INTERNAL_LOAD32(&run->stop) != 0u) {

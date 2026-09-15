@@ -243,6 +243,13 @@ sum of each node's declared `worker_claim` cannot exceed the graph budget. On a
 failure, in-flight nodes drain and the result reports completed, failed, and
 cancelled node bitsets plus each node's native status.
 
+> [!TIP]
+> Ready-node selection is permit-aware: a worker skips a ready node whose claim
+> is larger than the currently available budget and keeps looking for a smaller
+> runnable node. A failed permit race backs off and yields periodically, so a
+> heterogeneous graph can overlap useful work without a tight spin on one large
+> claim.
+
 ## Portable profiles
 
 `magic2_cpu_family_profile_export` and `magic2_cpu_family_profile_import` use a
@@ -355,9 +362,10 @@ tests, and CI workflow needed to build the runtime directly.
 Every push to `main` and every pull request runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 The workflow builds and runs [`examples/example.c`](./examples/example.c) and CPU/graph tests with Clang and GCC
 under C11 and C++17 AddressSanitizer/UndefinedBehaviorSanitizer, checks separate
-implementation linkage and allocator/async lifetime regressions, cross-builds
-MinGW-w64 x86-64 Windows artifacts, and runs the example plus public client and
-security regressions with MSVC on `windows-latest`.
+implementation linkage, allocator/async lifetime regressions, and heterogeneous
+`worker_claim` fairness, cross-builds MinGW-w64 x86-64 Windows artifacts, and
+runs the example plus public client and regression suite with MSVC on
+`windows-latest`.
 
 > [!WARNING]
 > CI proves compilation, API behavior, sanitizer cleanliness, and selected
