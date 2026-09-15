@@ -31,10 +31,24 @@ enum {
 };
 
 static uint64_t fairness_now_ns(void) {
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64() * UINT64_C(1000000);
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec value;
+    assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+    return (uint64_t)value.tv_sec * UINT64_C(1000000000) +
+        (uint64_t)value.tv_nsec;
+#elif defined(TIME_UTC)
     struct timespec value;
     assert(timespec_get(&value, TIME_UTC) == TIME_UTC);
     return (uint64_t)value.tv_sec * UINT64_C(1000000000) +
         (uint64_t)value.tv_nsec;
+#else
+    const clock_t value = clock();
+    assert(value != (clock_t)-1);
+    return (uint64_t)value * UINT64_C(1000000000) /
+        (uint64_t)CLOCKS_PER_SEC;
+#endif
 }
 
 static void fairness_sleep_ms(uint32_t milliseconds) {
