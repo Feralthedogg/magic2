@@ -3,7 +3,6 @@
 #include "../magic2.h"
 
 #include <assert.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -282,7 +281,7 @@ static magic2_graph *make_async_graph(
 }
 
 typedef union aligned_storage {
-    max_align_t alignment;
+    uintptr_t alignment;
     unsigned char bytes[128];
 } aligned_storage;
 
