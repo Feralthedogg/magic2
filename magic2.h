@@ -834,8 +834,8 @@ typedef int (*magic2_async_poll_fn)(
 /**
  * @brief Wait on a non-NULL handle returned by ::magic2_async_submit_fn.
  *
- * A successful callback may leave the state as ::MAGIC2_ASYNC_PENDING when
- * the supplied timeout expires; callers retain control of any retry budget.
+ * A successful wait may leave the state as ::MAGIC2_ASYNC_PENDING when the
+ * timeout expires.
  */
 typedef int (*magic2_async_wait_fn)(
     void *operation_user,
@@ -926,9 +926,8 @@ typedef struct magic2_run_status {
 /**
  * @brief Owning runtime handle identifying an asynchronous operation.
  *
- * The handle must be disjoint from every caller buffer passed to the
- * operation and from its status object.  Submission and progress APIs return
- * ::MAGIC2_EOVERLAP before touching metadata when this contract is violated.
+ * Keep it disjoint from caller buffers and the status object.  APIs return
+ * ::MAGIC2_EOVERLAP before writing metadata when the contract is violated.
  */
 typedef struct magic2_async_handle {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
@@ -942,8 +941,7 @@ typedef struct magic2_async_handle {
 /**
  * @brief Observed asynchronous state and its runtime and implementation results.
  *
- * The status object must be disjoint from every caller buffer passed to the
- * operation and from its owning handle.
+ * Keep it disjoint from caller buffers and the owning handle.
  */
 typedef struct magic2_async_status {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
@@ -1161,10 +1159,8 @@ typedef struct magic2_graph_port {
 /**
  * @brief Adaptive graph node and its context or callback binding.
  *
- * For ADAPTIVE and BUFFERS nodes, the graph retains the referenced context
- * until the graph is destroyed.  Destroying such a context while it is
- * retained therefore returns ::MAGIC2_EBUSY; destroy the graph first when
- * releasing both objects.
+ * ADAPTIVE and BUFFERS nodes retain their context until graph destruction;
+ * context destroy returns ::MAGIC2_EBUSY while that hold exists.
  */
 typedef struct magic2_graph_node_desc {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
@@ -1193,12 +1189,10 @@ typedef struct magic2_graph_binding {
 } magic2_graph_binding;
 
 /**
- * @brief Counts and storage requirements for the active compiled graph.
+ * @brief Counts and storage requirements for the active compiled snapshot.
  *
- * A graph may be mutated after a successful compile.  Until the next
- * successful compile, this structure continues to describe the immutable
- * execution snapshot that graph runs use; newly appended nodes and values are
- * reported after they become part of a compiled snapshot.
+ * Mutations remain pending until the next successful compile; runs and this
+ * structure continue to describe the last valid snapshot.
  */
 typedef struct magic2_graph_info {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
@@ -4516,9 +4510,7 @@ struct magic2_adaptive_context {
     struct magic2_internal_lock32 diagnostic_lock;
     struct magic2_internal_lock32 candidate_registry_lock;
     struct magic2_internal_lock32 shared_profile_lock;
-    /* Ordinary graph nodes retain this context without borrowing a
-     * scheduler/lifecycle reference.  The gate serializes graph retention
-     * with destruction so a graph can never observe freed context storage. */
+    /* Dedicated graph ownership gate; lifecycle refs remain operation-only. */
     struct magic2_internal_lock32 graph_hold_lock;
     MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_count;
     MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_blocked;
@@ -4763,7 +4755,7 @@ struct magic2_adaptive_buffer_context {
     MAGIC2_INTERNAL_ATOMIC_U64 release_epilogues;
     MAGIC2_INTERNAL_ATOMIC_U32 quarantined_async_count;
     struct magic2_internal_lock32 async_gate;
-    /* See magic2_adaptive_context::graph_hold_lock. */
+    /* Same graph ownership gate for buffer contexts. */
     struct magic2_internal_lock32 graph_hold_lock;
     MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_count;
     MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_blocked;
@@ -9934,20 +9926,7 @@ static void magic2_internal_context_release(magic2_adaptive_context *context) {
         &context->release_epilogues, UINT64_C(1));
 }
 
-/*
- * Graph ownership is deliberately tracked separately from the ordinary
- * operation lifecycle.  A graph may keep a context alive for a long time;
- * counting that ownership as an active operation would make candidate and
- * profile administration wait forever.  The gate instead makes retain and
- * destroy a small, explicit two-party protocol:
- *
- *   retain: lock -> reject while blocked -> increment -> unlock
- *   destroy: lock -> require zero -> set blocked -> unlock
- *
- * Once destruction has successfully claimed the gate, no new graph node can
- * acquire the pointer.  A failed TRY/DRAIN attempt clears the gate before it
- * returns, allowing graph mutation to continue.
- */
+/* Graph holds stay separate from operation refs so administration can drain. */
 static int magic2_internal_graph_hold_adaptive_context(
     magic2_adaptive_context *context) {
     int result = MAGIC2_OK;
@@ -12554,9 +12533,7 @@ static int magic2_destroy(magic2_adaptive_context **context_pointer, uint32_t po
         return MAGIC2_OK;
     }
 
-    /* Ordinary graph nodes retain their context through this gate.  Refuse
-     * destruction while any graph still owns the pointer, and prevent a new
-     * graph node from racing a destroy operation that has claimed the gate. */
+    /* Refuse destruction while a graph owns this context. */
     graph_result = magic2_internal_graph_begin_adaptive_destroy(context);
     if (graph_result != MAGIC2_OK) return graph_result;
 
@@ -13347,9 +13324,7 @@ static int magic2_internal_graph_allocate_array(
 static void magic2_internal_graph_cleanup(magic2_graph *graph) {
     uint32_t node_index;
     if (graph == NULL) return;
-    /* Drop the context ownership acquired for every retained graph node
-     * before releasing the graph's storage.  Context destruction is blocked
-     * while these counts are non-zero, so the pointers remain valid here. */
+    /* Release node context holds before releasing graph storage. */
     for (node_index = 0u; node_index < graph->node_count; ++node_index) {
         struct magic2_internal_graph_node *node = &graph->nodes[node_index];
         if (node->kind == MAGIC2_GRAPH_NODE_ADAPTIVE) {
@@ -13971,9 +13946,7 @@ static int magic2_graph_compile(
                     goto magic2_graph_compile_finish;
                 }
             } else if (producer == node_index) {
-                /* A node cannot read its own newly produced internal value.
-                 * This applies equally to READ_WRITE and to separate READ
-                 * and WRITE ports that name the same value. */
+                /* A node cannot read an internal value it produces. */
                 if ((value->flags &
                      (MAGIC2_GRAPH_VALUE_EXTERNAL | MAGIC2_GRAPH_VALUE_ZERO)) == 0u) {
                     result = MAGIC2_EDEPENDENCY;
@@ -14244,9 +14217,7 @@ static int magic2_internal_graph_prepare_values(
     return MAGIC2_OK;
 }
 
-/* Return whether two caller-visible memory spans overlap.  Graph metadata is
- * written by the runtime, so the ranges are checked with uintptr_t arithmetic
- * before any graph node can mutate its value storage. */
+/* Overflow-safe overlap check for caller-visible spans. */
 static int magic2_internal_graph_memory_overlap(
     const void *left, size_t left_bytes, const void *right,
     size_t right_bytes, int *overlap) {
@@ -14268,10 +14239,7 @@ static int magic2_internal_graph_memory_overlap(
     return MAGIC2_OK;
 }
 
-/* Check every compiled value span because a graph may use either external
- * bindings or offsets into caller scratch.  The full metadata objects are
- * checked: fill_status and graph_execution_handle_initializer write every
- * field, regardless of the descriptor's extensible struct_size. */
+/* Check metadata against every live value, including external bindings. */
 static int magic2_internal_graph_metadata_overlap(
     const magic2_graph *graph, void *const *value_pointers,
     const void *scratch, const void *handle, const void *status) {
@@ -14330,9 +14298,7 @@ static int magic2_internal_graph_metadata_overlap(
     return MAGIC2_OK;
 }
 
-/* Direct buffer asynchronous operations copy writable results back into the
- * caller's original spans.  Their owning handle and optional status object
- * therefore need the same disjointness guarantee as graph metadata. */
+/* Async copy-back requires metadata to be disjoint from caller buffers. */
 static int magic2_internal_buffer_metadata_overlap(
     const magic2_buffer_desc *buffers, size_t buffer_count,
     const void *handle, const void *status) {
@@ -14763,10 +14729,7 @@ static int magic2_internal_graph_async_advance(
             }
             if (mode == MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT &&
                 async_status.state == MAGIC2_ASYNC_PENDING) {
-                /* A backend wait with a finite (or zero) budget may make no
-                 * progress.  Return the live pending state to the caller;
-                 * retrying here would reuse the same timeout indefinitely and
-                 * could turn a non-blocking wait into an unbounded loop. */
+                /* Propagate PENDING; never reuse the same timeout in a loop. */
                 slot->runtime_status = operation_result;
                 slot->implementation_status =
                     async_status.implementation_status;
@@ -16526,9 +16489,7 @@ static int magic2_buffer_async_submit(
         magic2_internal_buffers_context_release(context);
         return MAGIC2_EUNSUPPORTED;
     }
-    /* Reaping a quarantined operation can copy data back into its original
-     * caller spans.  Reject a valid metadata/buffer overlap before that
-     * cleanup path gets a chance to write through the aliased pointer. */
+    /* Check before reaping; quarantine cleanup may copy into caller buffers. */
     if (call != NULL && call->buffers != NULL && call->buffer_count != 0u &&
         call->buffer_count <= MAGIC2_MAX_BUFFERS) {
         result = magic2_internal_buffer_metadata_overlap(

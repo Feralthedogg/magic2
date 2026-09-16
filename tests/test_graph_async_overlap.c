@@ -1,4 +1,4 @@
-/* Regression coverage for graph async metadata versus execution storage. */
+/* Graph async metadata and wait regressions. */
 #define MAGIC2_IMPLEMENTATION
 #include "../magic2.h"
 

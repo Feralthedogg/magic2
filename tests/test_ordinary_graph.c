@@ -1,4 +1,4 @@
-/* Regression coverage for ordinary graph ownership, dependencies, and snapshots. */
+/* Ordinary graph ownership, dependency, and snapshot regressions. */
 #define MAGIC2_IMPLEMENTATION
 #include "../magic2.h"
 
@@ -285,7 +285,7 @@ static void test_context_lifetime_retention(void) {
     adaptive_node.adaptive_context = adaptive;
     assert(dispatch_graph_add_node(graph, &adaptive_node, &node_index) == MAGIC2_OK);
 
-    /* A context retained by a graph cannot be freed out from under its node. */
+    /* Graph ownership keeps the node context alive. */
     assert(dispatch_context_destroy(&adaptive, MAGIC2_DESTROY_DRAIN) == MAGIC2_EBUSY);
     assert(adaptive != NULL);
     assert(dispatch_graph_compile(graph, &info) == MAGIC2_OK);
@@ -300,7 +300,7 @@ static void test_context_lifetime_retention(void) {
     assert(dispatch_graph_run(graph, bindings, 2u, NULL, 0u, &status) == MAGIC2_OK);
     assert(output[0] == 42u);
 
-    /* Add a buffer-backed node to the same graph and exercise its ownership. */
+    /* Buffer nodes retain their context as well. */
     buffer_ports[0] = port_desc(filled_index, MAGIC2_BUFFER_WRITE);
     buffer_node.kind = MAGIC2_GRAPH_NODE_BUFFERS;
     buffer_node.count = 8u;
@@ -311,7 +311,7 @@ static void test_context_lifetime_retention(void) {
     assert(dispatch_buffer_destroy(
         &buffer_context, MAGIC2_DESTROY_DRAIN) == MAGIC2_EBUSY);
     assert(buffer_context != NULL);
-    /* Recompile the newly mutated graph before running both nodes. */
+    /* Recompile after mutation. */
     assert(dispatch_graph_compile(graph, &info) == MAGIC2_OK);
     bindings[2] = MAGIC2_GRAPH_BINDING_INIT;
     bindings[2].value_index = filled_index;
@@ -348,8 +348,7 @@ static void test_self_read_dependency(void) {
     assert(info.compiled == 0u);
     assert(dispatch_graph_destroy(&graph, MAGIC2_DESTROY_TRY) == MAGIC2_OK);
 
-    /* EXTERNAL values are initialized by the caller and may be read/written
-     * by one node, so the same topology remains legal for that case. */
+    /* Caller-initialized values may be read and written in place. */
     graph = make_graph(1u, 1u, 2u);
     value = value_desc(MAGIC2_GRAPH_VALUE_EXTERNAL);
     assert(dispatch_graph_add_value(graph, &value, &value_index) == MAGIC2_OK);
@@ -403,7 +402,7 @@ static void test_compiled_info_snapshot(void) {
     assert(info.compiled == 1u);
     assert(info.node_count == 1u && info.value_count == 1u && info.port_count == 1u);
 
-    /* A failed recompile also leaves the last valid execution snapshot active. */
+    /* A failed compile preserves the last valid snapshot. */
     port = port_desc(first_value, MAGIC2_BUFFER_WRITE);
     node = callback_node(&port, 1u);
     node.callback = graph_noop;
@@ -478,7 +477,7 @@ static void test_external_scratch_alias(void) {
         graph, bindings, 2u, scratch, sizeof(scratch), &status) == MAGIC2_OK);
     assert(separate_output[0] == 99u && final_output[0] == 42u);
 
-    /* An external output cannot alias the graph's internal scratch arena. */
+    /* External outputs must stay disjoint from graph scratch. */
     memset(scratch, 0, sizeof(scratch));
     bindings[0].data = scratch;
     memset(final_output, 0, sizeof(final_output));
