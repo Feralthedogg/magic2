@@ -95,6 +95,7 @@ magic2/
 ├── examples/example.c          # minimal C11 executable example
 ├── tests/                      # C11/C++17 runtime and graph checks
 ├── image/magic2_logo.png       # project artwork
+├── Makefile                    # local build, test, sanitizer, and MinGW targets
 └── .github/workflows/ci.yml    # sanitizer, cross-build, and MSVC CI
 ```
 
@@ -385,15 +386,27 @@ preferable when the same exact regions are reused across many activations.
 The header is usable from C11 and C++17. The built-in executor uses the platform
 thread implementation only when its implementation translation unit is compiled.
 
+The Makefile provides the common local workflows:
+
+```sh
+make example    # build and run the example
+make test       # build and run C11 tests
+make test-cxx   # build and run C++17 tests
+make check      # run both test suites
+make sanitize   # ASan/UBSan builds and runs
+make mingw      # MinGW-w64 x86-64 cross-build
+make clean
+```
+
 ```sh
 # Linux / macOS / other Unix-like hosts (any supported architecture)
-clang -std=c11 -O2 -pthread -c impl.c -o magic2-runtime.o
+clang -std=c11 -O2 -pthread -c magic2_impl.c -o magic2-runtime.o
 
 # MinGW-w64 x86-64 cross-build (the CI Windows cross-build)
-x86_64-w64-mingw32-gcc -std=c11 -O2 -c impl.c -o magic2-runtime.o
+x86_64-w64-mingw32-gcc -std=c11 -O2 -c magic2_impl.c -o magic2-runtime.o
 
 # MSVC Developer Command Prompt (C11 mode)
-cl /nologo /TC /std:c11 /O2 /I. your_client.c magic2-runtime.c
+cl /nologo /TC /std:c11 /O2 /I. your_client.c magic2_impl.c
 ```
 
 The full source-only validation kit is available as `outputs/magic2.zip` in the
