@@ -287,15 +287,25 @@ before backend callbacks or copy-back can damage the operation capability.
 `magic2_run_status` follows the same rule for synchronous buffer calls; its
 write occurs only after the buffer metadata has been checked.
 
+Typed tuner wrappers preserve that ordering. Pair
+`implementation_status` is checked against the call descriptor and both
+payload spans before the selected kernel runs. Buffer `status` is checked
+against the typed call, descriptor array, tuner storage, and every declared
+buffer span before it is initialized. The dispatch batch path applies the same
+preflight to its request pointers, result array, progress counter, and outer
+request envelope, returning `MAGIC2_EOVERLAP` before any of those objects is
+written.
+
 For the same reason, external graph bindings must not overlap the graph's
 internal scratch arena.  `magic2_graph_run` and graph async submit reject that
 alias before any node executes; distinct external bindings remain governed by
 their declared buffer contracts.
 
 > [!NOTE]
-> The ordinary graph lifetime, self-dependency, post-compile snapshot, and
-> async metadata contracts are covered by `tests/test_ordinary_graph.c` and
-> `tests/test_graph_async_overlap.c` under the same C11 and C++17 sanitizer jobs
+> The ordinary graph lifetime, self-dependency, post-compile snapshot, async
+> metadata, and typed-wrapper alias contracts are covered by
+> `tests/test_ordinary_graph.c`, `tests/test_graph_async_overlap.c`, and
+> `tests/test_metadata_aliases.c` under the same C11 and C++17 sanitizer jobs
 > as the CPU and sealed-graph paths.
 
 ## Portable profiles

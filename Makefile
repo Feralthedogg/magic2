@@ -21,7 +21,8 @@ GRAPH_TEST_SOURCES := \
 	tests/test_security_lifetimes.c \
 	tests/test_parallel_fairness.c \
 	tests/test_ordinary_graph.c \
-	tests/test_graph_async_overlap.c
+	tests/test_graph_async_overlap.c \
+	tests/test_metadata_aliases.c
 
 C_TEST_BINS := $(patsubst tests/%.c,$(BUILD_DIR)/%,$(GRAPH_TEST_SOURCES))
 CXX_TEST_BINS := $(patsubst tests/%.c,$(BUILD_DIR)/%-cxx,$(GRAPH_TEST_SOURCES))

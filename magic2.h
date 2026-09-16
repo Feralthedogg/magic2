@@ -2152,7 +2152,8 @@ typedef union magic2_dispatch_arguments {
         size_t *processed_count;
         uint32_t flags;
         uint32_t reserved; /**< Reserved; initialize to zero. */
-    } batch;
+    } batch; /**< Batch storage must be disjoint from the enclosing request,
+              * the request-pointer array, and result/progress outputs. */
 } magic2_dispatch_arguments;
 
 /** @brief Tagged operation envelope accepted by ::magic2. */
@@ -3563,7 +3564,9 @@ MAGIC2_API int magic2_tuner_create(
  * @param call                  Call metadata and accessible input/output
  *                              spans.
  * @param implementation_status Optional output for the candidate's return
- *                              value.
+ *                              value. When supplied, it must be disjoint
+ *                              from the call descriptor and both payload
+ *                              spans; overlap is rejected before execution.
  *
  * @return ::MAGIC2_OK on success; an error code otherwise.
  */
@@ -3576,7 +3579,9 @@ MAGIC2_API int magic2_tuner_run_pair(
  *
  * @param tuner  Live buffer tuner.
  * @param call   Ordered buffer descriptors and call metadata.
- * @param status Optional output for runtime and implementation status.
+ * @param status Optional output for runtime and implementation status. It
+ *               must be disjoint from the call descriptor, buffer
+ *               descriptors, and every declared buffer span.
  *
  * @return ::MAGIC2_OK on success; an error code otherwise.
  */
@@ -14391,6 +14396,83 @@ static int magic2_internal_buffer_metadata_overlap(
         buffers, buffer_count, status, sizeof(magic2_async_status));
 }
 
+/* Tuner wrappers write caller metadata only after proving that it cannot
+ * overwrite the call description, its payloads, or the owning tuner. */
+static int magic2_internal_pair_status_overlap(
+    const magic2_tuner *tuner, const magic2_pair_call *call,
+    const void *implementation_status, size_t output_bytes) {
+    int overlap;
+    int result;
+    if (implementation_status == NULL) return MAGIC2_OK;
+    if (call == NULL) return MAGIC2_EINVAL;
+    result = magic2_internal_graph_memory_overlap(
+        implementation_status, sizeof(int), call, sizeof(*call), &overlap);
+    if (result != MAGIC2_OK) return result;
+    if (overlap) return MAGIC2_EOVERLAP;
+    result = magic2_internal_graph_memory_overlap(
+        implementation_status, sizeof(int), call->output, output_bytes,
+        &overlap);
+    if (result != MAGIC2_OK) return result;
+    if (overlap) return MAGIC2_EOVERLAP;
+    result = magic2_internal_graph_memory_overlap(
+        implementation_status, sizeof(int), call->input, call->input_bytes,
+        &overlap);
+    if (result != MAGIC2_OK) return result;
+    if (overlap) return MAGIC2_EOVERLAP;
+    if (tuner != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            implementation_status, sizeof(int), tuner, sizeof(*tuner),
+            &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    return MAGIC2_OK;
+}
+
+/* The typed buffer wrapper builds a second descriptor array before entering
+ * the adaptive context, so its status output must also avoid that metadata. */
+static int magic2_internal_tuner_buffer_status_overlap(
+    const magic2_tuner *tuner, const magic2_tuner_buffer_call *call,
+    const void *status) {
+    size_t descriptors_bytes;
+    size_t index;
+    int overlap;
+    int result;
+    if (status == NULL) return MAGIC2_OK;
+    if (call == NULL) return MAGIC2_EINVAL;
+    result = magic2_internal_graph_memory_overlap(
+        status, sizeof(magic2_run_status), call, sizeof(*call), &overlap);
+    if (result != MAGIC2_OK) return result;
+    if (overlap) return MAGIC2_EOVERLAP;
+    if (call->buffer_count != 0u && call->buffers == NULL)
+        return MAGIC2_EINVAL;
+    if (!magic2_internal_size_mul(
+            call->buffer_count, sizeof(*call->buffers), &descriptors_bytes))
+        return MAGIC2_EINVAL;
+    if (descriptors_bytes != 0u) {
+        result = magic2_internal_graph_memory_overlap(
+            status, sizeof(magic2_run_status), call->buffers,
+            descriptors_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    for (index = 0u; index < call->buffer_count; ++index) {
+        result = magic2_internal_graph_memory_overlap(
+            status, sizeof(magic2_run_status), call->buffers[index].data,
+            call->buffers[index].bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (tuner != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            status, sizeof(magic2_run_status), tuner, sizeof(*tuner),
+            &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    return MAGIC2_OK;
+}
+
 static int magic2_internal_graph_zero_first_use(
     const magic2_graph *graph, uint32_t order_position,
     void *const *value_pointers) {
@@ -17877,8 +17959,9 @@ MAGIC2_API int magic2_tuner_run_pair(
     magic2_tuner *tuner, const magic2_pair_call *call,
     int *implementation_status) {
     magic2_call general_call;
+    int candidate_status = 0;
+    size_t output_bytes;
     int result;
-    if (implementation_status != NULL) *implementation_status = 0;
     if (tuner == NULL || tuner->kind != MAGIC2_PLAN_KIND_PAIR || call == NULL ||
         call->tag != MAGIC2_TAG_SEALED ||
         call->struct_size < sizeof(*call) ||
@@ -17886,6 +17969,11 @@ MAGIC2_API int magic2_tuner_run_pair(
         (call->flags & ~MAGIC2_CALL_ALL_FLAGS) != 0u ||
         (call->parameters == NULL && call->parameter_bytes != 0u))
         return MAGIC2_EABI;
+    output_bytes = call->output_bytes != 0u ? call->output_bytes :
+        (tuner->pair_context != NULL ? tuner->pair_context->output_bytes : 0u);
+    result = magic2_internal_pair_status_overlap(
+        tuner, call, implementation_status, output_bytes);
+    if (result != MAGIC2_OK) return result;
     result = magic2_internal_sealed_tuner_acquire(tuner);
     if (result != MAGIC2_OK) return result;
     general_call = magic2_call_initializer();
@@ -17897,9 +17985,9 @@ MAGIC2_API int magic2_tuner_run_pair(
     general_call.count = call->count;
     general_call.user_key = call->semantic_key;
     general_call.user = call->call_user;
-    result = magic2_run(tuner->pair_context, &general_call,
-                       implementation_status);
+    result = magic2_run(tuner->pair_context, &general_call, &candidate_status);
     magic2_internal_sealed_tuner_release_ref(tuner);
+    if (implementation_status != NULL) *implementation_status = candidate_status;
     return result;
 }
 
@@ -17910,7 +17998,6 @@ MAGIC2_API int magic2_tuner_run_buffers(
     magic2_adaptive_buffer_call general_call;
     size_t index;
     int result;
-    if (status != NULL) *status = magic2_run_status_initializer();
     if (tuner == NULL || tuner->kind != MAGIC2_PLAN_KIND_BUFFERS ||
         call == NULL || call->tag != MAGIC2_TAG_SEALED ||
         call->struct_size < sizeof(*call) ||
@@ -17919,6 +18006,9 @@ MAGIC2_API int magic2_tuner_run_buffers(
         call->buffer_count > MAGIC2_MAX_BUFFERS ||
         (call->parameters == NULL && call->parameter_bytes != 0u))
         return MAGIC2_EABI;
+    result = magic2_internal_tuner_buffer_status_overlap(tuner, call, status);
+    if (result != MAGIC2_OK) return result;
+    if (status != NULL) *status = magic2_run_status_initializer();
     result = magic2_internal_sealed_tuner_acquire(tuner);
     if (result != MAGIC2_OK) return result;
     for (index = 0u; index < call->buffer_count; ++index) {
@@ -25994,6 +26084,78 @@ magic2_parallel_graph_admitted_fail:
 }
 
 
+/* Batch output writes are destructive to the request-pointer array and to the
+ * enclosing envelope.  Validate every caller-owned span before clearing any
+ * progress or implementation field. */
+static int magic2_internal_dispatch_batch_preflight(
+    const magic2_dispatch_request *request) {
+    void *const *requests;
+    const size_t request_count = request != NULL ?
+        request->args.batch.request_count : 0u;
+    int *results;
+    size_t request_bytes;
+    size_t result_bytes;
+    const size_t envelope_bytes = offsetof(magic2_dispatch_request, args) +
+        sizeof(((magic2_dispatch_request *)0)->args.batch);
+    size_t processed_bytes = sizeof(size_t);
+    int overlap;
+    int result;
+    if (request == NULL) return MAGIC2_EINVAL;
+    if ((request->args.batch.flags & ~MAGIC2_DISPATCH_BATCH_FLAGS_ALL) != 0u ||
+        (request_count != 0u && request->args.batch.requests == NULL))
+        return MAGIC2_EINVAL;
+    if (!magic2_internal_size_mul(request_count, sizeof(void *),
+                                  &request_bytes) ||
+        !magic2_internal_size_mul(request_count, sizeof(int),
+                                  &result_bytes))
+        return MAGIC2_EINVAL;
+    requests = request->args.batch.requests;
+    results = request->args.batch.results;
+    if (requests != NULL && request_bytes != 0u &&
+        results != NULL && result_bytes != 0u) {
+        result = magic2_internal_graph_memory_overlap(
+            requests, request_bytes, results, result_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (requests != NULL && request_bytes != 0u &&
+        request->args.batch.processed_count != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            requests, request_bytes, request->args.batch.processed_count,
+            processed_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (results != NULL && result_bytes != 0u &&
+        request->args.batch.processed_count != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            results, result_bytes, request->args.batch.processed_count,
+            processed_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (requests != NULL && request_bytes != 0u) {
+        result = magic2_internal_graph_memory_overlap(
+            requests, request_bytes, request, envelope_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (results != NULL && result_bytes != 0u) {
+        result = magic2_internal_graph_memory_overlap(
+            results, result_bytes, request, envelope_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (request->args.batch.processed_count != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            request->args.batch.processed_count, processed_bytes,
+            request, envelope_bytes, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    return MAGIC2_OK;
+}
+
 static int magic2_internal_dispatch_batch(
     magic2_dispatch_request *request, uint32_t depth) {
     void *const *requests = request->args.batch.requests;
@@ -26002,10 +26164,11 @@ static int magic2_internal_dispatch_batch(
     size_t *processed_count = request->args.batch.processed_count;
     const uint32_t flags = request->args.batch.flags;
     int first_error = MAGIC2_OK;
+    int result;
     size_t index;
 
-    if ((flags & ~MAGIC2_DISPATCH_BATCH_FLAGS_ALL) != 0u ||
-        (request_count != 0u && requests == NULL)) return MAGIC2_EINVAL;
+    result = magic2_internal_dispatch_batch_preflight(request);
+    if (result != MAGIC2_OK) return result;
     if (processed_count != NULL) *processed_count = 0u;
     if (results != NULL) {
         for (index = 0u; index < request_count; ++index)
@@ -26038,6 +26201,10 @@ static int magic2_internal_dispatch_request(
     magic2_dispatch_request *request, uint32_t depth) {
     int result = magic2_internal_validate_request(request, depth);
     if (result != MAGIC2_OK) return result;
+    if (request->operation == MAGIC2_OP_BATCH) {
+        result = magic2_internal_dispatch_batch_preflight(request);
+        if (result != MAGIC2_OK) return result;
+    }
     request->implementation_status = 0;
 
     switch (request->operation) {
