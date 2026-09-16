@@ -14225,6 +14225,8 @@ static int magic2_internal_graph_prepare_values(
     const magic2_graph *graph, const magic2_graph_binding *bindings,
     size_t binding_count, void *scratch, size_t scratch_bytes,
     void **value_pointers) {
+    const size_t binding_tag_size = offsetof(magic2_graph_binding, tag) +
+        sizeof(((magic2_graph_binding *)0)->tag);
     const size_t binding_min_size =
         offsetof(magic2_graph_binding, bytes) + sizeof(((magic2_graph_binding *)0)->bytes);
     uint32_t value_index;
@@ -14242,7 +14244,8 @@ static int magic2_internal_graph_prepare_values(
     for (binding_index = 0u; binding_index < binding_count; ++binding_index) {
         const magic2_graph_binding *binding = &bindings[binding_index];
         const struct magic2_internal_graph_value *value;
-        if (binding->tag != MAGIC2_TAG_GRAPH ||
+        if (binding->struct_size < binding_tag_size ||
+            binding->tag != MAGIC2_TAG_GRAPH ||
             binding->struct_size < binding_min_size) return MAGIC2_EABI;
         if (binding->value_index >= graph->compiled_value_count)
             return MAGIC2_EINVAL;
@@ -14363,6 +14366,8 @@ static int magic2_internal_graph_metadata_overlap(
 static int magic2_internal_graph_binding_metadata_overlap(
     const magic2_graph *graph, const magic2_graph_binding *bindings,
     size_t binding_count, const void *metadata, size_t metadata_bytes) {
+    const size_t binding_tag_size = offsetof(magic2_graph_binding, tag) +
+        sizeof(((magic2_graph_binding *)0)->tag);
     const size_t binding_min_size =
         offsetof(magic2_graph_binding, bytes) +
         sizeof(((magic2_graph_binding *)0)->bytes);
@@ -14375,7 +14380,8 @@ static int magic2_internal_graph_binding_metadata_overlap(
     for (index = 0u; index < binding_count; ++index) {
         const magic2_graph_binding *binding = &bindings[index];
         const struct magic2_internal_graph_value *value;
-        if (binding->tag != MAGIC2_TAG_GRAPH ||
+        if (binding->struct_size < binding_tag_size ||
+            binding->tag != MAGIC2_TAG_GRAPH ||
             binding->struct_size < binding_min_size ||
             binding->value_index >= graph->compiled_value_count) {
             invalid = 1;
