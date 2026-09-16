@@ -32,7 +32,7 @@ jobs:
         env:
           CC: ${{ matrix.compiler }}
         run: |
-          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c tests/test_security_lifetimes.c tests/test_parallel_fairness.c tests/test_ordinary_graph.c tests/test_graph_async_overlap.c tests/test_metadata_aliases.c; do
+          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c tests/test_security_lifetimes.c tests/test_parallel_fairness.c tests/test_ordinary_graph.c tests/test_graph_async_overlap.c tests/test_metadata_aliases.c tests/test_isolation_v2.c; do
             name=$(basename "$source" .c)
             "$CC" -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-function \
               -pthread -fsanitize=address,undefined "$source" -o "$name"
@@ -43,7 +43,7 @@ jobs:
         env:
           CXX: ${{ matrix.cxx }}
         run: |
-          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c tests/test_security_lifetimes.c tests/test_parallel_fairness.c tests/test_ordinary_graph.c tests/test_graph_async_overlap.c tests/test_metadata_aliases.c; do
+          for source in tests/test_cpu_runtime.c tests/test_parallel_graph.c tests/test_random_graph.c tests/test_security_lifetimes.c tests/test_parallel_fairness.c tests/test_ordinary_graph.c tests/test_graph_async_overlap.c tests/test_metadata_aliases.c tests/test_isolation_v2.c; do
             name=$(basename "$source" .c)-cxx
             "$CXX" -x c++ -std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-unused-function \
               -pthread -fsanitize=address,undefined "$source" -o "$name"
@@ -96,6 +96,9 @@ jobs:
           x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -I. \
             tests/test_metadata_aliases.c -static -static-libgcc \
             -o metadata-aliases.exe
+          x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -I. \
+            tests/test_isolation_v2.c -static -static-libgcc \
+            -o isolation-v2.exe
 
   windows-msvc:
     runs-on: windows-latest
@@ -138,3 +141,8 @@ jobs:
         run: |
           cl /nologo /std:c11 /TC /W4 /WX /O2 /I. tests\test_metadata_aliases.c /Fe:metadata-aliases-msvc.exe
           metadata-aliases-msvc.exe
+      - name: Build and run MSVC transitive isolation regressions
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /TC /W4 /WX /O2 /I. tests\test_isolation_v2.c /Fe:isolation-v2-msvc.exe
+          isolation-v2-msvc.exe

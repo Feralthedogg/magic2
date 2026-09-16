@@ -284,8 +284,9 @@ the owning `magic2_async_handle` and `magic2_async_status` must be disjoint from
 all buffer spans.  Submit, poll, wait, cancel, and release reject an overlap
 before backend callbacks or copy-back can damage the operation capability.
 
-`magic2_run_status` follows the same rule for synchronous buffer calls; its
-write occurs only after the buffer metadata has been checked.
+`magic2_run_status` follows the same rule for synchronous buffer calls; the
+status must be disjoint from the call descriptor, descriptor array, and every
+buffer span, and its write occurs only after those checks.
 
 Typed tuner wrappers preserve that ordering. Pair
 `implementation_status` is checked against the call descriptor and both
@@ -296,6 +297,15 @@ preflight to its request pointers, result array, progress counter, and outer
 request envelope, returning `MAGIC2_EOVERLAP` before any of those objects is
 written.
 
+Dispatch batches snapshot the complete child request-pointer array before
+running user code, keep result/progress writes in private storage, and inspect
+each child envelope plus identifiable payload spans before execution. This
+prevents a child output from changing the pointer used to dispatch a later
+child and turns metadata aliases into `MAGIC2_EOVERLAP` before the batch runs.
+
+Profile export also checks `actual_size` against the serialized output span
+before publishing the required size or writing the `M2PROF` envelope.
+
 For the same reason, external graph bindings must not overlap the graph's
 internal scratch arena.  `magic2_graph_run` and graph async submit reject that
 alias before any node executes; distinct external bindings remain governed by
@@ -303,10 +313,11 @@ their declared buffer contracts.
 
 > [!NOTE]
 > The ordinary graph lifetime, self-dependency, post-compile snapshot, async
-> metadata, and typed-wrapper alias contracts are covered by
-> `tests/test_ordinary_graph.c`, `tests/test_graph_async_overlap.c`, and
-> `tests/test_metadata_aliases.c` under the same C11 and C++17 sanitizer jobs
-> as the CPU and sealed-graph paths.
+> metadata, typed-wrapper alias, and transitive dispatch isolation contracts
+> are covered by `tests/test_ordinary_graph.c`,
+> `tests/test_graph_async_overlap.c`, `tests/test_metadata_aliases.c`, and
+> `tests/test_isolation_v2.c` under the same C11 and C++17 sanitizer jobs as
+> the CPU and sealed-graph paths.
 
 ## Portable profiles
 
