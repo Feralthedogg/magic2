@@ -273,6 +273,21 @@ submit, progress, cancel, release, and synchronous run reject such layouts with
 `MAGIC2_EOVERLAP` before writing caller metadata.  This prevents a pending
 execution from corrupting the handle needed to release it.
 
+An async backend is allowed to answer a wait with `PENDING`.  A graph wait
+returns that state after the single backend wait attempt, including for a zero
+timeout, so the caller keeps control of the wait budget and can retry without
+an internal unbounded loop.
+
+The direct buffer async API applies the same rule to its caller-owned buffers:
+the owning `magic2_async_handle` and `magic2_async_status` must be disjoint from
+all buffer spans.  Submit, poll, wait, cancel, and release reject an overlap
+before backend callbacks or copy-back can damage the operation capability.
+
+For the same reason, external graph bindings must not overlap the graph's
+internal scratch arena.  `magic2_graph_run` and graph async submit reject that
+alias before any node executes; distinct external bindings remain governed by
+their declared buffer contracts.
+
 > [!NOTE]
 > The ordinary graph lifetime, self-dependency, post-compile snapshot, and
 > async metadata contracts are covered by `tests/test_ordinary_graph.c` and

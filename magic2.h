@@ -831,7 +831,12 @@ typedef int (*magic2_async_poll_fn)(
     void *candidate_user
 );
 
-/** @brief Wait on a non-NULL handle returned by ::magic2_async_submit_fn. */
+/**
+ * @brief Wait on a non-NULL handle returned by ::magic2_async_submit_fn.
+ *
+ * A successful callback may leave the state as ::MAGIC2_ASYNC_PENDING when
+ * the supplied timeout expires; callers retain control of any retry budget.
+ */
 typedef int (*magic2_async_wait_fn)(
     void *operation_user,
     uint64_t timeout_ns,
@@ -918,7 +923,13 @@ typedef struct magic2_run_status {
     int implementation_status;
 } magic2_run_status;
 
-/** @brief Owning runtime handle identifying an asynchronous operation. */
+/**
+ * @brief Owning runtime handle identifying an asynchronous operation.
+ *
+ * The handle must be disjoint from every caller buffer passed to the
+ * operation and from its status object.  Submission and progress APIs return
+ * ::MAGIC2_EOVERLAP before touching metadata when this contract is violated.
+ */
 typedef struct magic2_async_handle {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -928,7 +939,12 @@ typedef struct magic2_async_handle {
     uint32_t generation;
 } magic2_async_handle;
 
-/** @brief Observed asynchronous state and its runtime and implementation results. */
+/**
+ * @brief Observed asynchronous state and its runtime and implementation results.
+ *
+ * The status object must be disjoint from every caller buffer passed to the
+ * operation and from its owning handle.
+ */
 typedef struct magic2_async_status {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -1803,6 +1819,10 @@ static int magic2_graph_async_release(
     magic2_graph *graph, magic2_graph_execution_handle *handle);
 static int magic2_graph_destroy(
     magic2_graph **graph, uint32_t policy);
+static int magic2_internal_graph_memory_overlap(
+    const void *left, size_t left_bytes, const void *right,
+    size_t right_bytes, int *overlap);
+static int magic2_internal_cpu_clock(uint64_t *nanoseconds);
 #endif /* MAGIC2_IMPLEMENTATION */
 
 
@@ -14176,6 +14196,8 @@ static int magic2_internal_graph_prepare_values(
         offsetof(magic2_graph_binding, bytes) + sizeof(((magic2_graph_binding *)0)->bytes);
     uint32_t value_index;
     size_t binding_index;
+    int overlap;
+    int overlap_result;
     memset(value_pointers, 0,
            (size_t)graph->compiled_value_count * sizeof(*value_pointers));
     if (graph->scratch_bytes != 0u) {
@@ -14197,6 +14219,13 @@ static int magic2_internal_graph_prepare_values(
             binding->data == NULL || binding->bytes < value->bytes ||
             !magic2_internal_graph_pointer_is_aligned(
                 binding->data, value->alignment)) return MAGIC2_EINVAL;
+        if (graph->scratch_bytes != 0u) {
+            overlap_result = magic2_internal_graph_memory_overlap(
+                binding->data, value->bytes, scratch, graph->scratch_bytes,
+                &overlap);
+            if (overlap_result != MAGIC2_OK) return overlap_result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
         value_pointers[binding->value_index] = binding->data;
     }
     for (value_index = 0u; value_index < graph->compiled_value_count;
@@ -14294,6 +14323,45 @@ static int magic2_internal_graph_metadata_overlap(
             result = magic2_internal_graph_memory_overlap(
                 status, sizeof(magic2_graph_run_status),
                 pointer, value->bytes, &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+    }
+    return MAGIC2_OK;
+}
+
+/* Direct buffer asynchronous operations copy writable results back into the
+ * caller's original spans.  Their owning handle and optional status object
+ * therefore need the same disjointness guarantee as graph metadata. */
+static int magic2_internal_buffer_metadata_overlap(
+    const magic2_buffer_desc *buffers, size_t buffer_count,
+    const void *handle, const void *status) {
+    size_t index;
+    int overlap;
+    int result;
+    if (buffers == NULL || buffer_count == 0u ||
+        buffer_count > MAGIC2_MAX_BUFFERS) return MAGIC2_EINVAL;
+    if (handle != NULL && status != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            handle, sizeof(magic2_async_handle),
+            status, sizeof(magic2_async_status), &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    for (index = 0u; index < buffer_count; ++index) {
+        if (buffers[index].data == NULL || buffers[index].bytes == 0u)
+            return MAGIC2_EINVAL;
+        if (handle != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                handle, sizeof(magic2_async_handle),
+                buffers[index].data, buffers[index].bytes, &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+        if (status != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                status, sizeof(magic2_async_status),
+                buffers[index].data, buffers[index].bytes, &overlap);
             if (result != MAGIC2_OK) return result;
             if (overlap) return MAGIC2_EOVERLAP;
         }
@@ -14423,20 +14491,32 @@ static int magic2_graph_run(
     uint32_t position;
     uint32_t completed = 0u;
     uint32_t initialize_zero_values;
+    int metadata_overlap;
     int implementation_status = 0;
     int result;
     if (!magic2_internal_graph_status_valid(status)) return MAGIC2_EABI;
     if (bindings == NULL && binding_count != 0u) return MAGIC2_EINVAL;
     result = magic2_internal_graph_execution_acquire(graph);
     if (result != MAGIC2_OK) return result;
+    if (status != NULL && scratch != NULL && graph->scratch_bytes != 0u) {
+        result = magic2_internal_graph_memory_overlap(
+            status, sizeof(*status), scratch, graph->scratch_bytes,
+            &metadata_overlap);
+        if (result != MAGIC2_OK || metadata_overlap) {
+            magic2_internal_graph_execution_release(graph);
+            return result != MAGIC2_OK ? result : MAGIC2_EOVERLAP;
+        }
+    }
     initialize_zero_values = graph->compiled_zero_count;
     result = magic2_internal_graph_prepare_values(
         graph, bindings, binding_count, scratch, scratch_bytes,
         value_pointers);
     if (result != MAGIC2_OK) {
-        magic2_internal_graph_fill_status(
-            graph, MAGIC2_GRAPH_FAILED, UINT32_MAX, 0u, 0u, 0,
-            result, status);
+        if (result != MAGIC2_EOVERLAP) {
+            magic2_internal_graph_fill_status(
+                graph, MAGIC2_GRAPH_FAILED, UINT32_MAX, 0u, 0u, 0,
+                result, status);
+        }
         magic2_internal_graph_execution_release(graph);
         return result;
     }
@@ -14638,7 +14718,8 @@ static int magic2_buffer_internal_graph_async_finish(
 
 static int magic2_internal_graph_async_advance(
     magic2_graph *graph, struct magic2_internal_graph_async_slot *slot,
-    enum magic2_internal_graph_advance_mode mode, uint64_t timeout_ns) {
+    enum magic2_internal_graph_advance_mode mode, uint64_t timeout_ns,
+    uint64_t timeout_deadline_ns, int timeout_deadline_valid) {
     for (;;) {
         if (magic2_internal_graph_terminal(slot->state)) return MAGIC2_OK;
 
@@ -14648,6 +14729,7 @@ static int magic2_internal_graph_async_advance(
                 &graph->nodes[node_index];
             magic2_async_status async_status = magic2_async_status_initializer();
             int operation_result;
+            uint64_t wait_timeout_ns = timeout_ns;
             if (mode == MAGIC2_INTERNAL_GRAPH_ADVANCE_SUBMIT) {
                 slot->state = MAGIC2_GRAPH_PENDING;
                 return MAGIC2_OK;
@@ -14657,9 +14739,16 @@ static int magic2_internal_graph_async_advance(
                 operation_result = magic2_buffer_async_cancel(
                     node->buffer_context, &slot->buffer_handle, &async_status);
             } else if (mode == MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT) {
+                if (timeout_deadline_valid) {
+                    uint64_t now_ns;
+                    if (magic2_internal_cpu_clock(&now_ns) == MAGIC2_OK) {
+                        wait_timeout_ns = now_ns >= timeout_deadline_ns ?
+                            0u : timeout_deadline_ns - now_ns;
+                    }
+                }
                 operation_result = magic2_buffer_async_wait(
                     node->buffer_context, &slot->buffer_handle,
-                    timeout_ns, &async_status);
+                    wait_timeout_ns, &async_status);
             } else {
                 operation_result = magic2_buffer_async_poll(
                     node->buffer_context, &slot->buffer_handle, &async_status);
@@ -14671,6 +14760,18 @@ static int magic2_internal_graph_async_advance(
                     async_status.implementation_status;
                 slot->state = MAGIC2_GRAPH_PENDING;
                 return operation_result;
+            }
+            if (mode == MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT &&
+                async_status.state == MAGIC2_ASYNC_PENDING) {
+                /* A backend wait with a finite (or zero) budget may make no
+                 * progress.  Return the live pending state to the caller;
+                 * retrying here would reuse the same timeout indefinitely and
+                 * could turn a non-blocking wait into an unbounded loop. */
+                slot->runtime_status = operation_result;
+                slot->implementation_status =
+                    async_status.implementation_status;
+                slot->state = MAGIC2_GRAPH_PENDING;
+                return MAGIC2_OK;
             }
             (void)magic2_buffer_internal_graph_async_finish(
                 graph, slot, node_index, &async_status, operation_result);
@@ -14843,7 +14944,7 @@ static int magic2_graph_async_submit(
         &slot->generation);
     magic2_internal_graph_async_callback_enter(&callback_frame, graph);
     result = magic2_internal_graph_async_advance(
-        graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_SUBMIT, 0u);
+        graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_SUBMIT, 0u, 0u, 0);
     magic2_internal_graph_async_callback_leave(&callback_frame);
     magic2_internal_graph_async_fill_status(graph, slot, status);
     magic2_internal_unlock32(&slot->lock);
@@ -14869,7 +14970,7 @@ static int magic2_graph_async_poll(
         if (result == MAGIC2_OK) {
             magic2_internal_graph_async_callback_enter(&callback_frame, graph);
             result = magic2_internal_graph_async_advance(
-                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_POLL, 0u);
+                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_POLL, 0u, 0u, 0);
             magic2_internal_graph_async_callback_leave(&callback_frame);
             magic2_internal_graph_async_fill_status(graph, slot, status);
         }
@@ -14884,6 +14985,8 @@ static int magic2_graph_async_wait(
     uint64_t timeout_ns, magic2_graph_run_status *status) {
     struct magic2_internal_graph_async_slot *slot = NULL;
     struct magic2_internal_graph_async_callback_frame callback_frame;
+    uint64_t timeout_deadline_ns = 0u;
+    int timeout_deadline_valid = 0;
     int result;
     if (!magic2_internal_graph_status_valid(status)) return MAGIC2_EABI;
     if (magic2_internal_graph_async_callback_active(graph))
@@ -14892,12 +14995,23 @@ static int magic2_graph_async_wait(
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_graph_async_lookup_locked(graph, handle, &slot);
     if (result == MAGIC2_OK) {
+        if (timeout_ns != UINT64_MAX) {
+            uint64_t start_ns;
+            if (magic2_internal_cpu_clock(&start_ns) == MAGIC2_OK) {
+                timeout_deadline_ns = start_ns > UINT64_MAX - timeout_ns ?
+                    UINT64_MAX : start_ns + timeout_ns;
+                timeout_deadline_valid = 1;
+            } else if (timeout_ns == 0u) {
+                timeout_deadline_valid = 1;
+            }
+        }
         result = magic2_internal_graph_metadata_overlap(
             graph, slot->value_pointers, NULL, handle, status);
         if (result == MAGIC2_OK) {
             magic2_internal_graph_async_callback_enter(&callback_frame, graph);
             result = magic2_internal_graph_async_advance(
-                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT, timeout_ns);
+                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT, timeout_ns,
+                timeout_deadline_ns, timeout_deadline_valid);
             magic2_internal_graph_async_callback_leave(&callback_frame);
             magic2_internal_graph_async_fill_status(graph, slot, status);
         }
@@ -14927,7 +15041,8 @@ static int magic2_graph_async_cancel(
                 slot->cancelled = 1u;
                 magic2_internal_graph_async_callback_enter(&callback_frame, graph);
                 result = magic2_internal_graph_async_advance(
-                    graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_CANCEL, UINT64_MAX);
+                    graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_CANCEL, UINT64_MAX,
+                    0u, 0);
                 magic2_internal_graph_async_callback_leave(&callback_frame);
             }
             magic2_internal_graph_async_fill_status(graph, slot, status);
@@ -16411,6 +16526,18 @@ static int magic2_buffer_async_submit(
         magic2_internal_buffers_context_release(context);
         return MAGIC2_EUNSUPPORTED;
     }
+    /* Reaping a quarantined operation can copy data back into its original
+     * caller spans.  Reject a valid metadata/buffer overlap before that
+     * cleanup path gets a chance to write through the aliased pointer. */
+    if (call != NULL && call->buffers != NULL && call->buffer_count != 0u &&
+        call->buffer_count <= MAGIC2_MAX_BUFFERS) {
+        result = magic2_internal_buffer_metadata_overlap(
+            call->buffers, call->buffer_count, handle, status);
+        if (result == MAGIC2_EOVERLAP) {
+            magic2_internal_buffers_context_release(context);
+            return result;
+        }
+    }
     (void)magic2_internal_async_reap_quarantined(context);
     magic2_internal_lock32(&context->async_gate);
     if ((MAGIC2_INTERNAL_LOAD64(&context->lifecycle) &
@@ -16429,6 +16556,9 @@ static int magic2_buffer_async_submit(
     magic2_internal_async_reset_slot(slot);
     result = magic2_internal_buffers_prepare_call(
         context, &slot->scratch, call, &adaptive_call);
+    if (result == MAGIC2_OK)
+        result = magic2_internal_buffer_metadata_overlap(
+            call->buffers, call->buffer_count, handle, status);
     if (result == MAGIC2_OK)
         result = magic2_resolve(context->adaptive, &adaptive_call, &plan);
     if (result != MAGIC2_OK) {
@@ -16543,6 +16673,7 @@ static int magic2_buffer_async_poll(
     magic2_adaptive_buffer_context *context, const magic2_async_handle *handle,
     magic2_async_status *status) {
     struct magic2_internal_async_slot *slot = NULL;
+    int metadata_safe = 1;
     int result = magic2_internal_async_validate_status(status);
     if (result != MAGIC2_OK) return result;
     if (magic2_internal_callback_active_for(context != NULL ? context->adaptive : NULL))
@@ -16550,6 +16681,11 @@ static int magic2_buffer_async_poll(
     result = magic2_internal_buffers_context_acquire(context);
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_async_lookup_locked(context, handle, &slot);
+    if (result == MAGIC2_OK) {
+        result = magic2_internal_buffer_metadata_overlap(
+            slot->original_buffers, slot->buffer_count, handle, status);
+        if (result != MAGIC2_OK) metadata_safe = 0;
+    }
     if (result == MAGIC2_OK && slot->state == MAGIC2_ASYNC_PENDING) {
         if (slot->async_backend == 0u || slot->operation_user == NULL)
             result = MAGIC2_ESTATE;
@@ -16557,7 +16693,7 @@ static int magic2_buffer_async_poll(
             context, slot, MAGIC2_CALLBACK_ASYNC_POLL, 0u);
     }
     if (slot != NULL) {
-        magic2_internal_async_fill_status(slot, status);
+        if (metadata_safe) magic2_internal_async_fill_status(slot, status);
         magic2_internal_unlock32(&slot->operation_lock);
     }
     magic2_internal_buffers_context_release(context);
@@ -16568,6 +16704,7 @@ static int magic2_buffer_async_wait(
     magic2_adaptive_buffer_context *context, const magic2_async_handle *handle,
     uint64_t timeout_ns, magic2_async_status *status) {
     struct magic2_internal_async_slot *slot = NULL;
+    int metadata_safe = 1;
     int result = magic2_internal_async_validate_status(status);
     if (result != MAGIC2_OK) return result;
     if (magic2_internal_callback_active_for(context != NULL ? context->adaptive : NULL))
@@ -16575,6 +16712,11 @@ static int magic2_buffer_async_wait(
     result = magic2_internal_buffers_context_acquire(context);
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_async_lookup_locked(context, handle, &slot);
+    if (result == MAGIC2_OK) {
+        result = magic2_internal_buffer_metadata_overlap(
+            slot->original_buffers, slot->buffer_count, handle, status);
+        if (result != MAGIC2_OK) metadata_safe = 0;
+    }
     if (result == MAGIC2_OK && slot->state == MAGIC2_ASYNC_PENDING) {
         if (slot->async_backend == 0u || slot->operation_user == NULL)
             result = MAGIC2_ESTATE;
@@ -16582,7 +16724,7 @@ static int magic2_buffer_async_wait(
             context, slot, MAGIC2_CALLBACK_ASYNC_WAIT, timeout_ns);
     }
     if (slot != NULL) {
-        magic2_internal_async_fill_status(slot, status);
+        if (metadata_safe) magic2_internal_async_fill_status(slot, status);
         magic2_internal_unlock32(&slot->operation_lock);
     }
     magic2_internal_buffers_context_release(context);
@@ -16593,6 +16735,7 @@ static int magic2_buffer_async_cancel(
     magic2_adaptive_buffer_context *context, const magic2_async_handle *handle,
     magic2_async_status *status) {
     struct magic2_internal_async_slot *slot = NULL;
+    int metadata_safe = 1;
     int result = magic2_internal_async_validate_status(status);
     if (result != MAGIC2_OK) return result;
     if (magic2_internal_callback_active_for(context != NULL ? context->adaptive : NULL))
@@ -16600,6 +16743,11 @@ static int magic2_buffer_async_cancel(
     result = magic2_internal_buffers_context_acquire(context);
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_async_lookup_locked(context, handle, &slot);
+    if (result == MAGIC2_OK) {
+        result = magic2_internal_buffer_metadata_overlap(
+            slot->original_buffers, slot->buffer_count, handle, status);
+        if (result != MAGIC2_OK) metadata_safe = 0;
+    }
     if (result == MAGIC2_OK && slot->state == MAGIC2_ASYNC_PENDING) {
         const magic2_adaptive_buffer_candidate *candidate =
             &context->candidates[slot->selected_index];
@@ -16624,7 +16772,7 @@ static int magic2_buffer_async_cancel(
         }
     }
     if (slot != NULL) {
-        magic2_internal_async_fill_status(slot, status);
+        if (metadata_safe) magic2_internal_async_fill_status(slot, status);
         magic2_internal_unlock32(&slot->operation_lock);
     }
     magic2_internal_buffers_context_release(context);
@@ -16640,6 +16788,10 @@ static int magic2_buffer_async_release(
     result = magic2_internal_buffers_context_acquire(context);
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_async_lookup_locked(context, handle, &slot);
+    if (result == MAGIC2_OK) {
+        result = magic2_internal_buffer_metadata_overlap(
+            slot->original_buffers, slot->buffer_count, handle, NULL);
+    }
     if (result == MAGIC2_OK && !magic2_internal_async_terminal(slot->state))
         result = MAGIC2_EBUSY;
     if (result == MAGIC2_OK) {

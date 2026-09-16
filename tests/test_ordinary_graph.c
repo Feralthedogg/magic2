@@ -217,6 +217,40 @@ static int graph_noop(
     return 0;
 }
 
+static int graph_write_42(
+    magic2_buffer_desc *buffers, size_t buffer_count, size_t count,
+    void *call_user, void *node_user) {
+    (void)count;
+    (void)call_user;
+    (void)node_user;
+    assert(buffer_count == 1u);
+    ((unsigned char *)buffers[0].data)[0] = 42u;
+    return 0;
+}
+
+static int graph_write_99(
+    magic2_buffer_desc *buffers, size_t buffer_count, size_t count,
+    void *call_user, void *node_user) {
+    (void)count;
+    (void)call_user;
+    (void)node_user;
+    assert(buffer_count == 2u);
+    ((unsigned char *)buffers[1].data)[0] = 99u;
+    return 0;
+}
+
+static int graph_copy_first(
+    magic2_buffer_desc *buffers, size_t buffer_count, size_t count,
+    void *call_user, void *node_user) {
+    (void)count;
+    (void)call_user;
+    (void)node_user;
+    assert(buffer_count == 2u);
+    ((unsigned char *)buffers[1].data)[0] =
+        ((const unsigned char *)buffers[0].data)[0];
+    return 0;
+}
+
 static void test_context_lifetime_retention(void) {
     magic2_adaptive_context *adaptive = make_adaptive_context();
     magic2_adaptive_buffer_context *buffer_context = make_buffer_context();
@@ -386,10 +420,80 @@ static void test_compiled_info_snapshot(void) {
     assert(dispatch_graph_destroy(&graph, MAGIC2_DESTROY_TRY) == MAGIC2_OK);
 }
 
+static void test_external_scratch_alias(void) {
+    magic2_graph *graph = make_graph(3u, 3u, 5u);
+    magic2_graph_value_desc internal_value = value_desc(0u);
+    magic2_graph_value_desc external_value =
+        value_desc(MAGIC2_GRAPH_VALUE_EXTERNAL);
+    magic2_graph_port node0_port;
+    magic2_graph_port node1_ports[2];
+    magic2_graph_port node2_ports[2];
+    magic2_graph_node_desc node;
+    magic2_graph_info info = MAGIC2_GRAPH_INFO_INIT;
+    magic2_graph_binding bindings[2];
+    magic2_graph_run_status status = MAGIC2_GRAPH_RUN_STATUS_INIT;
+    unsigned char scratch[16] = { 0u };
+    unsigned char separate_output[8] = { 0u };
+    unsigned char final_output[8] = { 0u };
+    uint32_t internal_index;
+    uint32_t output_index;
+    uint32_t final_index;
+    uint32_t node_index;
+
+    assert(dispatch_graph_add_value(
+        graph, &internal_value, &internal_index) == MAGIC2_OK);
+    assert(dispatch_graph_add_value(
+        graph, &external_value, &output_index) == MAGIC2_OK);
+    assert(dispatch_graph_add_value(
+        graph, &external_value, &final_index) == MAGIC2_OK);
+
+    node0_port = port_desc(internal_index, MAGIC2_BUFFER_WRITE);
+    node = callback_node(&node0_port, 1u);
+    node.callback = graph_write_42;
+    assert(dispatch_graph_add_node(graph, &node, &node_index) == MAGIC2_OK);
+
+    node1_ports[0] = port_desc(internal_index, MAGIC2_BUFFER_READ);
+    node1_ports[1] = port_desc(output_index, MAGIC2_BUFFER_WRITE);
+    node = callback_node(node1_ports, 2u);
+    node.callback = graph_write_99;
+    assert(dispatch_graph_add_node(graph, &node, &node_index) == MAGIC2_OK);
+
+    node2_ports[0] = port_desc(internal_index, MAGIC2_BUFFER_READ);
+    node2_ports[1] = port_desc(final_index, MAGIC2_BUFFER_WRITE);
+    node = callback_node(node2_ports, 2u);
+    node.callback = graph_copy_first;
+    assert(dispatch_graph_add_node(graph, &node, &node_index) == MAGIC2_OK);
+
+    assert(dispatch_graph_compile(graph, &info) == MAGIC2_OK);
+    assert(info.scratch_bytes == 8u);
+    bindings[0] = MAGIC2_GRAPH_BINDING_INIT;
+    bindings[0].value_index = output_index;
+    bindings[0].data = separate_output;
+    bindings[0].bytes = sizeof(separate_output);
+    bindings[1] = MAGIC2_GRAPH_BINDING_INIT;
+    bindings[1].value_index = final_index;
+    bindings[1].data = final_output;
+    bindings[1].bytes = sizeof(final_output);
+    assert(dispatch_graph_run(
+        graph, bindings, 2u, scratch, sizeof(scratch), &status) == MAGIC2_OK);
+    assert(separate_output[0] == 99u && final_output[0] == 42u);
+
+    /* An external output cannot alias the graph's internal scratch arena. */
+    memset(scratch, 0, sizeof(scratch));
+    bindings[0].data = scratch;
+    memset(final_output, 0, sizeof(final_output));
+    assert(dispatch_graph_run(
+        graph, bindings, 2u, scratch, sizeof(scratch), &status) ==
+        MAGIC2_EOVERLAP);
+    assert(final_output[0] == 0u);
+    assert(dispatch_graph_destroy(&graph, MAGIC2_DESTROY_TRY) == MAGIC2_OK);
+}
+
 int main(void) {
     test_context_lifetime_retention();
     test_self_read_dependency();
     test_compiled_info_snapshot();
+    test_external_scratch_alias();
     puts("magic2 ordinary graph regressions passed");
     return 0;
 }

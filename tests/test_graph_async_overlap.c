@@ -13,6 +13,7 @@ typedef struct async_probe {
     uint32_t waits;
     uint32_t cancels;
     uint32_t releases;
+    uint32_t pending_waits;
 } async_probe;
 
 static int dispatch_buffer_create(
@@ -31,6 +32,63 @@ static int dispatch_buffer_destroy(
     request.operation = MAGIC2_OP_BUFFER_CONTEXT_DESTROY;
     request.args.buffer_destroy.context = context;
     request.args.buffer_destroy.policy = policy;
+    return magic2(&request);
+}
+
+static int dispatch_buffer_async_submit(
+    magic2_adaptive_buffer_context *context,
+    const magic2_adaptive_buffer_call *call,
+    magic2_async_handle *handle, magic2_async_status *status) {
+    magic2_dispatch_request request = MAGIC2_REQUEST_INIT;
+    request.operation = MAGIC2_OP_ASYNC_SUBMIT;
+    request.args.buffer_async_submit.context = context;
+    request.args.buffer_async_submit.call = call;
+    request.args.buffer_async_submit.handle = handle;
+    request.args.buffer_async_submit.status = status;
+    return magic2(&request);
+}
+
+static int dispatch_buffer_async_poll(
+    magic2_adaptive_buffer_context *context,
+    const magic2_async_handle *handle, magic2_async_status *status) {
+    magic2_dispatch_request request = MAGIC2_REQUEST_INIT;
+    request.operation = MAGIC2_OP_ASYNC_POLL;
+    request.args.buffer_async_poll.context = context;
+    request.args.buffer_async_poll.handle = handle;
+    request.args.buffer_async_poll.status = status;
+    return magic2(&request);
+}
+
+static int dispatch_buffer_async_wait(
+    magic2_adaptive_buffer_context *context,
+    const magic2_async_handle *handle, uint64_t timeout_ns,
+    magic2_async_status *status) {
+    magic2_dispatch_request request = MAGIC2_REQUEST_INIT;
+    request.operation = MAGIC2_OP_ASYNC_WAIT;
+    request.args.buffer_async_wait.context = context;
+    request.args.buffer_async_wait.handle = handle;
+    request.args.buffer_async_wait.timeout_ns = timeout_ns;
+    request.args.buffer_async_wait.status = status;
+    return magic2(&request);
+}
+
+static int dispatch_buffer_async_cancel(
+    magic2_adaptive_buffer_context *context,
+    const magic2_async_handle *handle, magic2_async_status *status) {
+    magic2_dispatch_request request = MAGIC2_REQUEST_INIT;
+    request.operation = MAGIC2_OP_ASYNC_CANCEL;
+    request.args.buffer_async_cancel.context = context;
+    request.args.buffer_async_cancel.handle = handle;
+    request.args.buffer_async_cancel.status = status;
+    return magic2(&request);
+}
+
+static int dispatch_buffer_async_release(
+    magic2_adaptive_buffer_context *context, magic2_async_handle *handle) {
+    magic2_dispatch_request request = MAGIC2_REQUEST_INIT;
+    request.operation = MAGIC2_OP_ASYNC_RELEASE;
+    request.args.buffer_async_release.context = context;
+    request.args.buffer_async_release.handle = handle;
     return magic2(&request);
 }
 
@@ -207,7 +265,12 @@ static int async_wait_complete(
     (void)timeout_ns;
     assert(operation_user != NULL && state != NULL && implementation_status != NULL);
     ++probe->waits;
-    *state = MAGIC2_ASYNC_COMPLETE;
+    if (probe->pending_waits != 0u) {
+        --probe->pending_waits;
+        *state = MAGIC2_ASYNC_PENDING;
+    } else {
+        *state = MAGIC2_ASYNC_COMPLETE;
+    }
     return 0;
 }
 
@@ -291,6 +354,91 @@ static void initialize_status_at(
     **status = MAGIC2_GRAPH_RUN_STATUS_INIT;
 }
 
+static void buffer_submit_pending(
+    magic2_adaptive_buffer_context *context,
+    magic2_adaptive_buffer_call *call,
+    magic2_async_handle *handle, magic2_async_status *status) {
+    *handle = MAGIC2_ASYNC_HANDLE_INIT;
+    *status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_submit(context, call, handle, status) == MAGIC2_OK);
+    assert(status->state == MAGIC2_ASYNC_PENDING);
+}
+
+static void test_direct_buffer_metadata_overlap(void) {
+    async_probe probe = { 0u, 0u, 0u, 0u, 0u, 0u };
+    magic2_adaptive_buffer_context *context = make_async_context(&probe);
+    magic2_adaptive_buffer_call call = MAGIC2_ADAPTIVE_BUFFER_CALL_INIT;
+    magic2_buffer_desc buffer = MAGIC2_BUFFER_INIT;
+    magic2_async_handle handle = MAGIC2_ASYNC_HANDLE_INIT;
+    magic2_async_status status = MAGIC2_ASYNC_STATUS_INIT;
+    aligned_storage storage;
+    aligned_storage output_storage;
+    magic2_async_handle *overlap_handle;
+    magic2_async_status *overlap_status;
+
+    buffer.data = storage.bytes;
+    buffer.bytes = 8u;
+    buffer.alignment = 1u;
+    buffer.stride = 1u;
+    buffer.access = MAGIC2_BUFFER_WRITE;
+    call.buffers = &buffer;
+    call.buffer_count = 1u;
+    call.count = 8u;
+
+    overlap_handle = (magic2_async_handle *)(void *)storage.bytes;
+    *overlap_handle = MAGIC2_ASYNC_HANDLE_INIT;
+    status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_submit(
+        context, &call, overlap_handle, &status) == MAGIC2_EOVERLAP);
+
+    overlap_status = (magic2_async_status *)(void *)storage.bytes;
+    *overlap_status = MAGIC2_ASYNC_STATUS_INIT;
+    handle = MAGIC2_ASYNC_HANDLE_INIT;
+    assert(dispatch_buffer_async_submit(
+        context, &call, &handle, overlap_status) == MAGIC2_EOVERLAP);
+
+    buffer.data = output_storage.bytes;
+    buffer_submit_pending(context, &call, &handle, &status);
+    overlap_status = (magic2_async_status *)(void *)output_storage.bytes;
+    *overlap_status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_poll(context, &handle, overlap_status) == MAGIC2_EOVERLAP);
+    status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_wait(
+        context, &handle, UINT64_MAX, &status) == MAGIC2_OK);
+    assert(dispatch_buffer_async_release(context, &handle) == MAGIC2_OK);
+
+    buffer_submit_pending(context, &call, &handle, &status);
+    overlap_status = (magic2_async_status *)(void *)output_storage.bytes;
+    *overlap_status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_wait(
+        context, &handle, 0u, overlap_status) == MAGIC2_EOVERLAP);
+    status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_wait(
+        context, &handle, UINT64_MAX, &status) == MAGIC2_OK);
+    assert(dispatch_buffer_async_release(context, &handle) == MAGIC2_OK);
+
+    buffer_submit_pending(context, &call, &handle, &status);
+    overlap_status = (magic2_async_status *)(void *)output_storage.bytes;
+    *overlap_status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_cancel(context, &handle, overlap_status) == MAGIC2_EOVERLAP);
+    status = MAGIC2_ASYNC_STATUS_INIT;
+    assert(dispatch_buffer_async_cancel(context, &handle, &status) == MAGIC2_OK);
+    assert(dispatch_buffer_async_release(context, &handle) == MAGIC2_OK);
+
+    buffer_submit_pending(context, &call, &handle, &status);
+    assert(dispatch_buffer_async_wait(
+        context, &handle, UINT64_MAX, &status) == MAGIC2_OK);
+    memcpy(output_storage.bytes, &handle, sizeof(handle));
+    overlap_handle = (magic2_async_handle *)(void *)output_storage.bytes;
+    assert(dispatch_buffer_async_release(context, overlap_handle) == MAGIC2_EOVERLAP);
+    assert(dispatch_buffer_async_release(context, &handle) == MAGIC2_OK);
+
+    assert(probe.submits == 4u);
+    assert(probe.releases == 4u);
+    assert(dispatch_buffer_destroy(&context, MAGIC2_DESTROY_DRAIN) == MAGIC2_OK);
+    assert(context == NULL);
+}
+
 static void test_submit_metadata_overlap(
     magic2_graph *graph, uint32_t scratch_bytes) {
     aligned_storage storage;
@@ -322,6 +470,10 @@ static void test_sync_metadata_overlap(
     magic2_graph *graph, uint32_t scratch_bytes) {
     aligned_storage storage;
     magic2_graph_run_status *status;
+    initialize_status_at(&storage, &status);
+    assert(dispatch_graph_run(
+        graph, NULL, 0u, storage.bytes, 0u, status) == MAGIC2_EOVERLAP);
+    assert(status->state == MAGIC2_GRAPH_IDLE);
     initialize_status_at(&storage, &status);
     assert(dispatch_graph_run(
         graph, NULL, 0u, storage.bytes, scratch_bytes, status) ==
@@ -395,7 +547,7 @@ static void test_release_handle_overlap(
 }
 
 int main(void) {
-    async_probe probe = { 0u, 0u, 0u, 0u, 0u };
+    async_probe probe = { 0u, 0u, 0u, 0u, 0u, 0u };
     magic2_adaptive_buffer_context *context = make_async_context(&probe);
     magic2_graph_info info = MAGIC2_GRAPH_INFO_INIT;
     magic2_graph *graph = make_async_graph(context, &info);
@@ -403,13 +555,34 @@ int main(void) {
     test_sync_metadata_overlap(graph, (uint32_t)info.scratch_bytes);
     test_status_overlap_on_progress(graph, (uint32_t)info.scratch_bytes);
     test_release_handle_overlap(graph, (uint32_t)info.scratch_bytes);
-    assert(probe.submits == 4u);
-    assert(probe.waits >= 4u);
-    assert(probe.releases == 4u);
+    {
+        aligned_storage scratch_storage;
+        magic2_graph_execution_handle handle;
+        magic2_graph_run_status status;
+        const uint32_t waits_before = probe.waits;
+        probe.pending_waits = 3u;
+        submit_pending(graph, scratch_storage.bytes, (uint32_t)info.scratch_bytes,
+                       &handle, &status);
+        status = MAGIC2_GRAPH_RUN_STATUS_INIT;
+        assert(dispatch_graph_async_wait(
+            graph, &handle, 0u, &status) == MAGIC2_OK);
+        assert(status.state == MAGIC2_GRAPH_PENDING);
+        assert(probe.waits == waits_before + 1u);
+        probe.pending_waits = 0u;
+        status = MAGIC2_GRAPH_RUN_STATUS_INIT;
+        assert(dispatch_graph_async_wait(
+            graph, &handle, 0u, &status) == MAGIC2_OK);
+        assert(status.state == MAGIC2_GRAPH_COMPLETE);
+        assert(dispatch_graph_async_release(graph, &handle) == MAGIC2_OK);
+    }
+    assert(probe.submits == 5u);
+    assert(probe.waits >= 5u);
+    assert(probe.releases == 5u);
     assert(dispatch_graph_destroy(&graph, MAGIC2_DESTROY_TRY) == MAGIC2_OK);
     assert(graph == NULL);
     assert(dispatch_buffer_destroy(&context, MAGIC2_DESTROY_DRAIN) == MAGIC2_OK);
     assert(context == NULL);
+    test_direct_buffer_metadata_overlap();
     puts("magic2 graph async overlap regressions passed");
     return 0;
 }
