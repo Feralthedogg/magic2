@@ -250,6 +250,28 @@ cancelled node bitsets plus each node's native status.
 > heterogeneous graph can overlap useful work without a tight spin on one large
 > claim.
 
+## Context-backed graphs
+
+The ordinary `magic2_graph_*` API is the compact graph form for adaptive pair,
+buffer, and callback nodes.  Adding an adaptive or buffer node retains its
+context until `magic2_graph_destroy`, so a context destroy request returns
+`MAGIC2_EBUSY` while the graph owns that node.  This makes it safe to compile a
+graph once and run it repeatedly without handing execution a dangling context;
+destroy the graph before releasing its node contexts.
+
+Compilation rejects an internal value read by the same node that produces it,
+including when the node spells the access as separate `READ` and `WRITE` ports.
+Use `MAGIC2_GRAPH_VALUE_EXTERNAL` for caller-initialized in-place values or
+`MAGIC2_GRAPH_VALUE_ZERO` for an explicitly zero-initialized value.  A successful
+compile is an immutable execution snapshot: if the mutable graph is extended,
+`magic2_graph_query` continues to report the counts and storage of the snapshot
+until the next successful compile, matching what `magic2_graph_run` executes.
+
+> [!NOTE]
+> The ordinary graph lifetime, self-dependency, and post-compile snapshot
+> contracts are covered by `tests/test_ordinary_graph.c` under the same C11 and
+> C++17 sanitizer jobs as the CPU and sealed-graph paths.
+
 ## Portable profiles
 
 `magic2_cpu_family_profile_export` and `magic2_cpu_family_profile_import` use a
@@ -363,8 +385,9 @@ Every push to `main` and every pull request runs [`.github/workflows/ci.yml`](./
 The workflow builds and runs [`examples/example.c`](./examples/example.c) and CPU/graph tests with Clang and GCC
 under C11 and C++17 AddressSanitizer/UndefinedBehaviorSanitizer, checks separate
 implementation linkage, allocator/async lifetime regressions, and heterogeneous
-`worker_claim` fairness, cross-builds MinGW-w64 x86-64 Windows artifacts, and
-runs the example plus public client and regression suite with MSVC on
+`worker_claim` fairness plus ordinary graph ownership/dependency snapshot
+regressions, cross-builds MinGW-w64 x86-64 Windows artifacts, and runs the
+example plus public client and regression suite with MSVC on
 `windows-latest`.
 
 > [!WARNING]

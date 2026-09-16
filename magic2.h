@@ -1142,7 +1142,14 @@ typedef struct magic2_graph_port {
     uint32_t flags;
 } magic2_graph_port;
 
-/** @brief Adaptive graph node and its context or callback binding. */
+/**
+ * @brief Adaptive graph node and its context or callback binding.
+ *
+ * For ADAPTIVE and BUFFERS nodes, the graph retains the referenced context
+ * until the graph is destroyed.  Destroying such a context while it is
+ * retained therefore returns ::MAGIC2_EBUSY; destroy the graph first when
+ * releasing both objects.
+ */
 typedef struct magic2_graph_node_desc {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -1169,7 +1176,14 @@ typedef struct magic2_graph_binding {
     size_t bytes;
 } magic2_graph_binding;
 
-/** @brief Compiled adaptive graph counts and storage requirements. */
+/**
+ * @brief Counts and storage requirements for the active compiled graph.
+ *
+ * A graph may be mutated after a successful compile.  Until the next
+ * successful compile, this structure continues to describe the immutable
+ * execution snapshot that graph runs use; newly appended nodes and values are
+ * reported after they become part of a compiled snapshot.
+ */
 typedef struct magic2_graph_info {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -1679,6 +1693,14 @@ static int magic2_profile_visit(
 static int magic2_set_runtime_mode(magic2_adaptive_context *context, uint32_t mode);
 static int magic2_after_fork_child(magic2_adaptive_context *context);
 static int magic2_destroy(magic2_adaptive_context **context, uint32_t policy);
+static int magic2_internal_graph_hold_adaptive_context(
+    magic2_adaptive_context *context);
+static void magic2_internal_graph_release_adaptive_context(
+    magic2_adaptive_context *context);
+static int magic2_internal_graph_begin_adaptive_destroy(
+    magic2_adaptive_context *context);
+static void magic2_internal_graph_cancel_adaptive_destroy(
+    magic2_adaptive_context *context);
 static int magic2_buffer_context_create(
     const magic2_adaptive_buffer_config *config, magic2_adaptive_buffer_context **out_context);
 static int magic2_buffer_context_run(
@@ -1691,6 +1713,14 @@ static int magic2_buffer_context_set_mode(
 
 static int magic2_buffer_context_destroy(
     magic2_adaptive_buffer_context **context, uint32_t policy);
+static int magic2_internal_graph_hold_buffer_context(
+    magic2_adaptive_buffer_context *context);
+static void magic2_internal_graph_release_buffer_context(
+    magic2_adaptive_buffer_context *context);
+static int magic2_internal_graph_begin_buffer_destroy(
+    magic2_adaptive_buffer_context *context);
+static void magic2_internal_graph_cancel_buffer_destroy(
+    magic2_adaptive_buffer_context *context);
 static int magic2_buffer_async_submit(
     magic2_adaptive_buffer_context *context, const magic2_adaptive_buffer_call *call,
     magic2_async_handle *handle, magic2_async_status *status);
@@ -4454,6 +4484,12 @@ struct magic2_adaptive_context {
     struct magic2_internal_lock32 diagnostic_lock;
     struct magic2_internal_lock32 candidate_registry_lock;
     struct magic2_internal_lock32 shared_profile_lock;
+    /* Ordinary graph nodes retain this context without borrowing a
+     * scheduler/lifecycle reference.  The gate serializes graph retention
+     * with destruction so a graph can never observe freed context storage. */
+    struct magic2_internal_lock32 graph_hold_lock;
+    MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_count;
+    MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_blocked;
     MAGIC2_INTERNAL_ATOMIC_U32 candidate_registry_mutating;
     MAGIC2_INTERNAL_ATOMIC_U32 administrative_owner;
     MAGIC2_INTERNAL_ATOMIC_U32 active_candidate_count;
@@ -4695,6 +4731,10 @@ struct magic2_adaptive_buffer_context {
     MAGIC2_INTERNAL_ATOMIC_U64 release_epilogues;
     MAGIC2_INTERNAL_ATOMIC_U32 quarantined_async_count;
     struct magic2_internal_lock32 async_gate;
+    /* See magic2_adaptive_context::graph_hold_lock. */
+    struct magic2_internal_lock32 graph_hold_lock;
+    MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_count;
+    MAGIC2_INTERNAL_ATOMIC_U32 graph_hold_blocked;
     magic2_adaptive_context *adaptive;
     magic2_alloc_fn alloc;
     magic2_free_fn dealloc;
@@ -9862,6 +9902,75 @@ static void magic2_internal_context_release(magic2_adaptive_context *context) {
         &context->release_epilogues, UINT64_C(1));
 }
 
+/*
+ * Graph ownership is deliberately tracked separately from the ordinary
+ * operation lifecycle.  A graph may keep a context alive for a long time;
+ * counting that ownership as an active operation would make candidate and
+ * profile administration wait forever.  The gate instead makes retain and
+ * destroy a small, explicit two-party protocol:
+ *
+ *   retain: lock -> reject while blocked -> increment -> unlock
+ *   destroy: lock -> require zero -> set blocked -> unlock
+ *
+ * Once destruction has successfully claimed the gate, no new graph node can
+ * acquire the pointer.  A failed TRY/DRAIN attempt clears the gate before it
+ * returns, allowing graph mutation to continue.
+ */
+static int magic2_internal_graph_hold_adaptive_context(
+    magic2_adaptive_context *context) {
+    int result = MAGIC2_OK;
+    if (context == NULL) return MAGIC2_ESTATE;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    if (context->cookie != MAGIC2_INTERNAL_CONTEXT_COOKIE) {
+        result = MAGIC2_ESTATE;
+    } else if (MAGIC2_INTERNAL_LOAD32(&context->fork_invalid) != 0u ||
+               context->owner_process_id != magic2_internal_process_id()) {
+        result = MAGIC2_EFORK;
+    } else if (MAGIC2_INTERNAL_LOAD32(&context->graph_hold_blocked) != 0u ||
+               MAGIC2_INTERNAL_LOAD32(&context->graph_hold_count) == UINT32_MAX) {
+        result = MAGIC2_EBUSY;
+    } else {
+        (void)MAGIC2_INTERNAL_FETCH_ADD32(&context->graph_hold_count, 1u);
+    }
+    magic2_internal_unlock32(&context->graph_hold_lock);
+    return result;
+}
+
+static void magic2_internal_graph_release_adaptive_context(
+    magic2_adaptive_context *context) {
+    if (context == NULL) return;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    if (MAGIC2_INTERNAL_LOAD32(&context->graph_hold_count) != 0u) {
+        (void)MAGIC2_INTERNAL_FETCH_SUB32(&context->graph_hold_count, 1u);
+    }
+    magic2_internal_unlock32(&context->graph_hold_lock);
+}
+
+static int magic2_internal_graph_begin_adaptive_destroy(
+    magic2_adaptive_context *context) {
+    int result = MAGIC2_OK;
+    if (context == NULL) return MAGIC2_ESTATE;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    if (context->cookie != MAGIC2_INTERNAL_CONTEXT_COOKIE) {
+        result = MAGIC2_ESTATE;
+    } else if (MAGIC2_INTERNAL_LOAD32(&context->graph_hold_blocked) != 0u ||
+               MAGIC2_INTERNAL_LOAD32(&context->graph_hold_count) != 0u) {
+        result = MAGIC2_EBUSY;
+    } else {
+        MAGIC2_INTERNAL_STORE32(&context->graph_hold_blocked, 1u);
+    }
+    magic2_internal_unlock32(&context->graph_hold_lock);
+    return result;
+}
+
+static void magic2_internal_graph_cancel_adaptive_destroy(
+    magic2_adaptive_context *context) {
+    if (context == NULL) return;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    MAGIC2_INTERNAL_STORE32(&context->graph_hold_blocked, 0u);
+    magic2_internal_unlock32(&context->graph_hold_lock);
+}
+
 static void magic2_internal_wait_release_epilogues(
     magic2_adaptive_context *wait_context, MAGIC2_INTERNAL_ATOMIC_U64 *epilogues) {
     uint32_t round = 0u;
@@ -10597,6 +10706,10 @@ static int magic2_create(const magic2_adaptive_config *config, magic2_adaptive_c
     MAGIC2_INTERNAL_STORE32(&context->runtime_mode, MAGIC2_MODE_ADAPTIVE);
     MAGIC2_INTERNAL_STORE32(&context->fork_invalid, 0u);
     context->owner_process_id = magic2_internal_process_id();
+    magic2_internal_lock32_initialize(&context->graph_hold_lock);
+    magic2_internal_lock32_bind(&context->graph_hold_lock, context);
+    MAGIC2_INTERNAL_STORE32_RELAXED(&context->graph_hold_count, 0u);
+    MAGIC2_INTERNAL_STORE32_RELAXED(&context->graph_hold_blocked, 0u);
     magic2_internal_lock32_initialize(&context->table_lock);
     magic2_internal_lock32_bind(&context->table_lock, context);
     magic2_internal_lock32_initialize(&context->profile_workspace_lock);
@@ -12391,6 +12504,7 @@ static int magic2_destroy(magic2_adaptive_context **context_pointer, uint32_t po
     magic2_free_fn dealloc;
     void *allocator_user;
     int flush_result = MAGIC2_OK;
+    int graph_result;
     if (context_pointer == NULL) return MAGIC2_EINVAL;
     context = *context_pointer;
     if (context == NULL) return MAGIC2_OK;
@@ -12408,23 +12522,37 @@ static int magic2_destroy(magic2_adaptive_context **context_pointer, uint32_t po
         return MAGIC2_OK;
     }
 
+    /* Ordinary graph nodes retain their context through this gate.  Refuse
+     * destruction while any graph still owns the pointer, and prevent a new
+     * graph node from racing a destroy operation that has claimed the gate. */
+    graph_result = magic2_internal_graph_begin_adaptive_destroy(context);
+    if (graph_result != MAGIC2_OK) return graph_result;
+
     state = MAGIC2_INTERNAL_LOAD64(&context->lifecycle);
     if (policy == MAGIC2_DESTROY_TRY) {
         if (state != 0u ||
-            MAGIC2_INTERNAL_LOAD64(&context->release_epilogues) != 0u)
+            MAGIC2_INTERNAL_LOAD64(&context->release_epilogues) != 0u) {
+            magic2_internal_graph_cancel_adaptive_destroy(context);
             return MAGIC2_EBUSY;
+        }
         magic2_internal_lifecycle_test_hook(
             context, MAGIC2_INTERNAL_TEST_LIFECYCLE_BEFORE_TRY_CAS);
         desired = MAGIC2_INTERNAL_LIFECYCLE_CLOSING;
-        if (!magic2_internal_cas64(&context->lifecycle, &state, desired))
+        if (!magic2_internal_cas64(&context->lifecycle, &state, desired)) {
+            magic2_internal_graph_cancel_adaptive_destroy(context);
             return MAGIC2_EBUSY;
+        }
         if (MAGIC2_INTERNAL_LOAD64(&context->release_epilogues) != 0u) {
             MAGIC2_INTERNAL_STORE64(&context->lifecycle, 0u);
+            magic2_internal_graph_cancel_adaptive_destroy(context);
             return MAGIC2_EBUSY;
         }
     } else {
         for (;;) {
-            if ((state & MAGIC2_INTERNAL_LIFECYCLE_CLOSING) != 0u) return MAGIC2_EBUSY;
+            if ((state & MAGIC2_INTERNAL_LIFECYCLE_CLOSING) != 0u) {
+                magic2_internal_graph_cancel_adaptive_destroy(context);
+                return MAGIC2_EBUSY;
+            }
             desired = state | MAGIC2_INTERNAL_LIFECYCLE_CLOSING;
             if (magic2_internal_cas64(&context->lifecycle, &state, desired)) break;
         }
@@ -13185,7 +13313,20 @@ static int magic2_internal_graph_allocate_array(
 }
 
 static void magic2_internal_graph_cleanup(magic2_graph *graph) {
+    uint32_t node_index;
     if (graph == NULL) return;
+    /* Drop the context ownership acquired for every retained graph node
+     * before releasing the graph's storage.  Context destruction is blocked
+     * while these counts are non-zero, so the pointers remain valid here. */
+    for (node_index = 0u; node_index < graph->node_count; ++node_index) {
+        struct magic2_internal_graph_node *node = &graph->nodes[node_index];
+        if (node->kind == MAGIC2_GRAPH_NODE_ADAPTIVE) {
+            magic2_internal_graph_release_adaptive_context(
+                node->adaptive_context);
+        } else if (node->kind == MAGIC2_GRAPH_NODE_BUFFERS) {
+            magic2_internal_graph_release_buffer_context(node->buffer_context);
+        }
+    }
     magic2_internal_free_with(graph->dealloc, graph->async_value_pointers,
                              graph->allocator_user);
     magic2_internal_free_with(graph->dealloc, graph->async_slots_allocation,
@@ -13256,13 +13397,17 @@ static int magic2_internal_graph_status_valid(
 static void magic2_internal_graph_fill_info(
     const magic2_graph *graph, magic2_graph_info *info) {
     magic2_graph_info snapshot;
+    const uint32_t compiled = MAGIC2_INTERNAL_LOAD32(&graph->compiled);
     if (info == NULL) return;
     snapshot = magic2_graph_info_initializer();
     snapshot.generation = MAGIC2_INTERNAL_LOAD64(&graph->generation);
-    snapshot.node_count = graph->node_count;
-    snapshot.value_count = graph->value_count;
-    snapshot.port_count = graph->port_count;
-    snapshot.compiled = MAGIC2_INTERNAL_LOAD32(&graph->compiled);
+    snapshot.node_count = compiled != 0u ?
+        graph->compiled_node_count : graph->node_count;
+    snapshot.value_count = compiled != 0u ?
+        graph->compiled_value_count : graph->value_count;
+    snapshot.port_count = compiled != 0u ?
+        graph->compiled_port_count : graph->port_count;
+    snapshot.compiled = compiled;
     snapshot.scratch_bytes = graph->scratch_bytes;
     snapshot.scratch_alignment = graph->scratch_alignment;
     snapshot.async_execution_capacity = graph->async_execution_capacity;
@@ -13626,15 +13771,21 @@ static int magic2_graph_add_node(
             write_count += 1u;
     }
     if ((node->kind == MAGIC2_GRAPH_NODE_ADAPTIVE &&
-         (node->adaptive_context == NULL || node->adaptive_context->cookie !=
-              MAGIC2_INTERNAL_CONTEXT_COOKIE || node->port_count != 2u ||
+         (node->adaptive_context == NULL || node->port_count != 2u ||
           read_count != 1u || write_count != 1u)) ||
         (node->kind == MAGIC2_GRAPH_NODE_BUFFERS &&
-         (node->buffer_context == NULL || node->buffer_context->cookie !=
-              MAGIC2_INTERNAL_BUFFERS_CONTEXT_COOKIE)) ||
+         node->buffer_context == NULL) ||
         (node->kind == MAGIC2_GRAPH_NODE_CALLBACK && node->callback == NULL)) {
         result = MAGIC2_EINVAL;
         goto magic2_graph_add_node_finish;
+    }
+    if (node->kind == MAGIC2_GRAPH_NODE_ADAPTIVE) {
+        result = magic2_internal_graph_hold_adaptive_context(
+            node->adaptive_context);
+        if (result != MAGIC2_OK) goto magic2_graph_add_node_finish;
+    } else if (node->kind == MAGIC2_GRAPH_NODE_BUFFERS) {
+        result = magic2_internal_graph_hold_buffer_context(node->buffer_context);
+        if (result != MAGIC2_OK) goto magic2_graph_add_node_finish;
     }
     node_index = graph->node_count;
     destination = &graph->nodes[node_index];
@@ -13788,8 +13939,10 @@ static int magic2_graph_compile(
                     goto magic2_graph_compile_finish;
                 }
             } else if (producer == node_index) {
-                if (port->access == MAGIC2_BUFFER_READ_WRITE &&
-                    (value->flags &
+                /* A node cannot read its own newly produced internal value.
+                 * This applies equally to READ_WRITE and to separate READ
+                 * and WRITE ports that name the same value. */
+                if ((value->flags &
                      (MAGIC2_GRAPH_VALUE_EXTERNAL | MAGIC2_GRAPH_VALUE_ZERO)) == 0u) {
                     result = MAGIC2_EDEPENDENCY;
                     goto magic2_graph_compile_finish;
@@ -14777,6 +14930,65 @@ static int magic2_internal_buffers_context_fork_check(
     return MAGIC2_OK;
 }
 
+static int magic2_internal_graph_hold_buffer_context(
+    magic2_adaptive_buffer_context *context) {
+    int fork_result;
+    int result = MAGIC2_OK;
+    if (context == NULL) return MAGIC2_ESTATE;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    if (context->cookie != MAGIC2_INTERNAL_BUFFERS_CONTEXT_COOKIE) {
+        result = MAGIC2_ESTATE;
+    } else {
+        fork_result = magic2_internal_buffers_context_fork_check(context);
+        if (fork_result != MAGIC2_OK) {
+            result = fork_result;
+        } else if (MAGIC2_INTERNAL_LOAD32(&context->graph_hold_blocked) != 0u ||
+                   MAGIC2_INTERNAL_LOAD32(&context->graph_hold_count) ==
+                       UINT32_MAX) {
+            result = MAGIC2_EBUSY;
+        } else {
+            (void)MAGIC2_INTERNAL_FETCH_ADD32(&context->graph_hold_count, 1u);
+        }
+    }
+    magic2_internal_unlock32(&context->graph_hold_lock);
+    return result;
+}
+
+static void magic2_internal_graph_release_buffer_context(
+    magic2_adaptive_buffer_context *context) {
+    if (context == NULL) return;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    if (MAGIC2_INTERNAL_LOAD32(&context->graph_hold_count) != 0u) {
+        (void)MAGIC2_INTERNAL_FETCH_SUB32(&context->graph_hold_count, 1u);
+    }
+    magic2_internal_unlock32(&context->graph_hold_lock);
+}
+
+static int magic2_internal_graph_begin_buffer_destroy(
+    magic2_adaptive_buffer_context *context) {
+    int result = MAGIC2_OK;
+    if (context == NULL) return MAGIC2_ESTATE;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    if (context->cookie != MAGIC2_INTERNAL_BUFFERS_CONTEXT_COOKIE) {
+        result = MAGIC2_ESTATE;
+    } else if (MAGIC2_INTERNAL_LOAD32(&context->graph_hold_blocked) != 0u ||
+               MAGIC2_INTERNAL_LOAD32(&context->graph_hold_count) != 0u) {
+        result = MAGIC2_EBUSY;
+    } else {
+        MAGIC2_INTERNAL_STORE32(&context->graph_hold_blocked, 1u);
+    }
+    magic2_internal_unlock32(&context->graph_hold_lock);
+    return result;
+}
+
+static void magic2_internal_graph_cancel_buffer_destroy(
+    magic2_adaptive_buffer_context *context) {
+    if (context == NULL) return;
+    magic2_internal_lock32(&context->graph_hold_lock);
+    MAGIC2_INTERNAL_STORE32(&context->graph_hold_blocked, 0u);
+    magic2_internal_unlock32(&context->graph_hold_lock);
+}
+
 static int magic2_internal_buffers_context_acquire(magic2_adaptive_buffer_context *context) {
     uint64_t state;
     int fork_result;
@@ -15578,6 +15790,10 @@ static int magic2_buffer_context_create(
     if (result != MAGIC2_OK) { magic2_internal_buffers_cleanup(context); return result; }
     magic2_internal_lock32_initialize(&context->async_gate);
     magic2_internal_lock32_bind(&context->async_gate, context->adaptive);
+    magic2_internal_lock32_initialize(&context->graph_hold_lock);
+    magic2_internal_lock32_bind(&context->graph_hold_lock, context->adaptive);
+    MAGIC2_INTERNAL_STORE32_RELAXED(&context->graph_hold_count, 0u);
+    MAGIC2_INTERNAL_STORE32_RELAXED(&context->graph_hold_blocked, 0u);
 
     for (index = 0u; index < context->session_count; ++index) {
         unsigned char *base = context->session_memory +
@@ -16347,19 +16563,26 @@ static int magic2_buffer_context_destroy(
     if (magic2_internal_callback_active_for(context->adaptive)) return MAGIC2_EREENTRANT;
     if (policy != MAGIC2_DESTROY_TRY && policy != MAGIC2_DESTROY_DRAIN)
         return MAGIC2_EINVAL;
+    result = magic2_internal_graph_begin_buffer_destroy(context);
+    if (result != MAGIC2_OK) return result;
     (void)magic2_internal_async_reap_quarantined(context);
     state = MAGIC2_INTERNAL_LOAD64(&context->lifecycle);
     if (policy == MAGIC2_DESTROY_TRY) {
         if (state != 0u ||
-            MAGIC2_INTERNAL_LOAD64(&context->release_epilogues) != 0u)
+            MAGIC2_INTERNAL_LOAD64(&context->release_epilogues) != 0u) {
+            magic2_internal_graph_cancel_buffer_destroy(context);
             return MAGIC2_EBUSY;
+        }
         magic2_internal_lifecycle_test_hook(
             context->adaptive, MAGIC2_INTERNAL_TEST_LIFECYCLE_BEFORE_TRY_CAS);
         desired = MAGIC2_INTERNAL_LIFECYCLE_CLOSING;
-        if (!magic2_internal_cas64(&context->lifecycle, &state, desired))
+        if (!magic2_internal_cas64(&context->lifecycle, &state, desired)) {
+            magic2_internal_graph_cancel_buffer_destroy(context);
             return MAGIC2_EBUSY;
+        }
         if (MAGIC2_INTERNAL_LOAD64(&context->release_epilogues) != 0u) {
             MAGIC2_INTERNAL_STORE64(&context->lifecycle, 0u);
+            magic2_internal_graph_cancel_buffer_destroy(context);
             return MAGIC2_EBUSY;
         }
     } else {
@@ -16371,6 +16594,7 @@ static int magic2_buffer_context_destroy(
             if (MAGIC2_INTERNAL_LOAD32(
                     &context->async_slots[async_index].occupied) != 0u) {
                 magic2_internal_unlock32(&context->async_gate);
+                magic2_internal_graph_cancel_buffer_destroy(context);
                 return MAGIC2_EBUSY;
             }
         }
@@ -16378,6 +16602,7 @@ static int magic2_buffer_context_destroy(
         for (;;) {
             if ((state & MAGIC2_INTERNAL_LIFECYCLE_CLOSING) != 0u) {
                 magic2_internal_unlock32(&context->async_gate);
+                magic2_internal_graph_cancel_buffer_destroy(context);
                 return MAGIC2_EBUSY;
             }
             desired = state | MAGIC2_INTERNAL_LIFECYCLE_CLOSING;
@@ -16404,7 +16629,10 @@ static int magic2_buffer_context_destroy(
             context->adaptive, &context->release_epilogues);
     }
     result = magic2_destroy(&context->adaptive, MAGIC2_DESTROY_TRY);
-    if (result != MAGIC2_OK) return result;
+    if (result != MAGIC2_OK) {
+        magic2_internal_graph_cancel_buffer_destroy(context);
+        return result;
+    }
     context->cookie = 0u;
     *context_pointer = NULL;
     magic2_internal_buffers_cleanup(context);
