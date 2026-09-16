@@ -136,7 +136,7 @@ static void test_buffer_status_alias(void) {
     magic2_run_status status = magic2_run_status_initializer();
     magic2_run_status before;
     union {
-        max_align_t alignment;
+        uintptr_t alignment;
         unsigned char bytes[128];
     } output_storage;
     int input = 41;
