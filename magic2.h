@@ -1198,7 +1198,13 @@ typedef struct magic2_graph_info {
     uint32_t async_execution_occupancy;
 } magic2_graph_info;
 
-/** @brief Runtime and node-completion results for an adaptive graph run. */
+/**
+ * @brief Runtime and node-completion results for an adaptive graph run.
+ *
+ * The object must be disjoint from every bound graph value and the graph's
+ * scratch storage.  The graph rejects overlapping metadata with
+ * ::MAGIC2_EOVERLAP before execution or status writes begin.
+ */
 typedef struct magic2_graph_run_status {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -1212,7 +1218,13 @@ typedef struct magic2_graph_run_status {
     uint32_t reserved;    /**< Reserved; initialize to zero. */
 } magic2_graph_run_status;
 
-/** @brief Handle for an asynchronous adaptive graph execution. */
+/**
+ * @brief Handle for an asynchronous adaptive graph execution.
+ *
+ * The handle must be disjoint from graph values, scratch storage, and any
+ * status object supplied to the same operation so progress cannot corrupt the
+ * capability required to release the execution.
+ */
 typedef struct magic2_graph_execution_handle {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -14203,6 +14215,92 @@ static int magic2_internal_graph_prepare_values(
     return MAGIC2_OK;
 }
 
+/* Return whether two caller-visible memory spans overlap.  Graph metadata is
+ * written by the runtime, so the ranges are checked with uintptr_t arithmetic
+ * before any graph node can mutate its value storage. */
+static int magic2_internal_graph_memory_overlap(
+    const void *left, size_t left_bytes, const void *right,
+    size_t right_bytes, int *overlap) {
+    uintptr_t left_start;
+    uintptr_t right_start;
+    uintptr_t left_end;
+    uintptr_t right_end;
+    if (overlap == NULL) return MAGIC2_EINVAL;
+    *overlap = 0;
+    if (left_bytes == 0u || right_bytes == 0u) return MAGIC2_OK;
+    if (left == NULL || right == NULL) return MAGIC2_EINVAL;
+    left_start = (uintptr_t)left;
+    right_start = (uintptr_t)right;
+    if (left_bytes > UINTPTR_MAX - left_start ||
+        right_bytes > UINTPTR_MAX - right_start) return MAGIC2_EINVAL;
+    left_end = left_start + (uintptr_t)left_bytes;
+    right_end = right_start + (uintptr_t)right_bytes;
+    *overlap = left_start < right_end && right_start < left_end;
+    return MAGIC2_OK;
+}
+
+/* Check every compiled value span because a graph may use either external
+ * bindings or offsets into caller scratch.  The full metadata objects are
+ * checked: fill_status and graph_execution_handle_initializer write every
+ * field, regardless of the descriptor's extensible struct_size. */
+static int magic2_internal_graph_metadata_overlap(
+    const magic2_graph *graph, void *const *value_pointers,
+    const void *scratch, const void *handle, const void *status) {
+    size_t scratch_bytes;
+    uint32_t value_index;
+    int overlap;
+    int result;
+    if (graph == NULL || value_pointers == NULL) return MAGIC2_EINVAL;
+    scratch_bytes = graph->scratch_bytes;
+    if (handle != NULL && status != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            handle, sizeof(magic2_graph_execution_handle),
+            status, sizeof(magic2_graph_run_status), &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    if (scratch != NULL && scratch_bytes != 0u) {
+        if (handle != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                handle, sizeof(magic2_graph_execution_handle),
+                scratch, scratch_bytes, &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+        if (status != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                status, sizeof(magic2_graph_run_status),
+                scratch, scratch_bytes, &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+    }
+    for (value_index = 0u; value_index < graph->compiled_value_count;
+         ++value_index) {
+        const struct magic2_internal_graph_value *value;
+        const void *pointer;
+        if (graph->compiled_used[value_index] == 0u) continue;
+        pointer = value_pointers[value_index];
+        if (pointer == NULL) return MAGIC2_ESTATE;
+        value = &graph->values[value_index];
+        if (handle != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                handle, sizeof(magic2_graph_execution_handle),
+                pointer, value->bytes, &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+        if (status != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                status, sizeof(magic2_graph_run_status),
+                pointer, value->bytes, &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+    }
+    return MAGIC2_OK;
+}
+
 static int magic2_internal_graph_zero_first_use(
     const magic2_graph *graph, uint32_t order_position,
     void *const *value_pointers) {
@@ -14339,6 +14437,12 @@ static int magic2_graph_run(
         magic2_internal_graph_fill_status(
             graph, MAGIC2_GRAPH_FAILED, UINT32_MAX, 0u, 0u, 0,
             result, status);
+        magic2_internal_graph_execution_release(graph);
+        return result;
+    }
+    result = magic2_internal_graph_metadata_overlap(
+        graph, value_pointers, scratch, NULL, status);
+    if (result != MAGIC2_OK) {
         magic2_internal_graph_execution_release(graph);
         return result;
     }
@@ -14711,6 +14815,15 @@ static int magic2_graph_async_submit(
         magic2_internal_graph_api_release(graph);
         return result;
     }
+    result = magic2_internal_graph_metadata_overlap(
+        graph, slot->value_pointers, scratch, handle, status);
+    if (result != MAGIC2_OK) {
+        magic2_internal_unlock32(&slot->lock);
+        MAGIC2_INTERNAL_STORE32(&slot->occupied, 0u);
+        magic2_internal_graph_execution_release(graph);
+        magic2_internal_graph_api_release(graph);
+        return result;
+    }
     result = magic2_internal_graph_next_execution_id(graph, &execution_id);
     if (result != MAGIC2_OK) {
         magic2_internal_unlock32(&slot->lock);
@@ -14751,11 +14864,15 @@ static int magic2_graph_async_poll(
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_graph_async_lookup_locked(graph, handle, &slot);
     if (result == MAGIC2_OK) {
-        magic2_internal_graph_async_callback_enter(&callback_frame, graph);
-        result = magic2_internal_graph_async_advance(
-            graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_POLL, 0u);
-        magic2_internal_graph_async_callback_leave(&callback_frame);
-        magic2_internal_graph_async_fill_status(graph, slot, status);
+        result = magic2_internal_graph_metadata_overlap(
+            graph, slot->value_pointers, NULL, handle, status);
+        if (result == MAGIC2_OK) {
+            magic2_internal_graph_async_callback_enter(&callback_frame, graph);
+            result = magic2_internal_graph_async_advance(
+                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_POLL, 0u);
+            magic2_internal_graph_async_callback_leave(&callback_frame);
+            magic2_internal_graph_async_fill_status(graph, slot, status);
+        }
         magic2_internal_unlock32(&slot->lock);
     }
     magic2_internal_graph_api_release(graph);
@@ -14775,11 +14892,15 @@ static int magic2_graph_async_wait(
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_graph_async_lookup_locked(graph, handle, &slot);
     if (result == MAGIC2_OK) {
-        magic2_internal_graph_async_callback_enter(&callback_frame, graph);
-        result = magic2_internal_graph_async_advance(
-            graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT, timeout_ns);
-        magic2_internal_graph_async_callback_leave(&callback_frame);
-        magic2_internal_graph_async_fill_status(graph, slot, status);
+        result = magic2_internal_graph_metadata_overlap(
+            graph, slot->value_pointers, NULL, handle, status);
+        if (result == MAGIC2_OK) {
+            magic2_internal_graph_async_callback_enter(&callback_frame, graph);
+            result = magic2_internal_graph_async_advance(
+                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_WAIT, timeout_ns);
+            magic2_internal_graph_async_callback_leave(&callback_frame);
+            magic2_internal_graph_async_fill_status(graph, slot, status);
+        }
         magic2_internal_unlock32(&slot->lock);
     }
     magic2_internal_graph_api_release(graph);
@@ -14799,14 +14920,18 @@ static int magic2_graph_async_cancel(
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_graph_async_lookup_locked(graph, handle, &slot);
     if (result == MAGIC2_OK) {
-        if (!magic2_internal_graph_terminal(slot->state)) {
-            slot->cancelled = 1u;
-            magic2_internal_graph_async_callback_enter(&callback_frame, graph);
-            result = magic2_internal_graph_async_advance(
-                graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_CANCEL, UINT64_MAX);
-            magic2_internal_graph_async_callback_leave(&callback_frame);
+        result = magic2_internal_graph_metadata_overlap(
+            graph, slot->value_pointers, NULL, handle, status);
+        if (result == MAGIC2_OK) {
+            if (!magic2_internal_graph_terminal(slot->state)) {
+                slot->cancelled = 1u;
+                magic2_internal_graph_async_callback_enter(&callback_frame, graph);
+                result = magic2_internal_graph_async_advance(
+                    graph, slot, MAGIC2_INTERNAL_GRAPH_ADVANCE_CANCEL, UINT64_MAX);
+                magic2_internal_graph_async_callback_leave(&callback_frame);
+            }
+            magic2_internal_graph_async_fill_status(graph, slot, status);
         }
-        magic2_internal_graph_async_fill_status(graph, slot, status);
         magic2_internal_unlock32(&slot->lock);
     }
     magic2_internal_graph_api_release(graph);
@@ -14823,6 +14948,10 @@ static int magic2_graph_async_release(
     result = magic2_internal_graph_api_acquire(graph);
     if (result != MAGIC2_OK) return result;
     result = magic2_internal_graph_async_lookup_locked(graph, handle, &slot);
+    if (result == MAGIC2_OK) {
+        result = magic2_internal_graph_metadata_overlap(
+            graph, slot->value_pointers, NULL, handle, NULL);
+    }
     if (result == MAGIC2_OK && !magic2_internal_graph_terminal(slot->state))
         result = MAGIC2_EBUSY;
     if (result == MAGIC2_OK && slot->buffer_handle.slot_index != UINT32_MAX)

@@ -267,10 +267,17 @@ compile is an immutable execution snapshot: if the mutable graph is extended,
 `magic2_graph_query` continues to report the counts and storage of the snapshot
 until the next successful compile, matching what `magic2_graph_run` executes.
 
+Graph run metadata is kept disjoint from execution storage.  `status` and async
+`handle` buffers may not overlap compiled scratch/value spans or each other;
+submit, progress, cancel, release, and synchronous run reject such layouts with
+`MAGIC2_EOVERLAP` before writing caller metadata.  This prevents a pending
+execution from corrupting the handle needed to release it.
+
 > [!NOTE]
-> The ordinary graph lifetime, self-dependency, and post-compile snapshot
-> contracts are covered by `tests/test_ordinary_graph.c` under the same C11 and
-> C++17 sanitizer jobs as the CPU and sealed-graph paths.
+> The ordinary graph lifetime, self-dependency, post-compile snapshot, and
+> async metadata contracts are covered by `tests/test_ordinary_graph.c` and
+> `tests/test_graph_async_overlap.c` under the same C11 and C++17 sanitizer jobs
+> as the CPU and sealed-graph paths.
 
 ## Portable profiles
 
@@ -385,9 +392,9 @@ Every push to `main` and every pull request runs [`.github/workflows/ci.yml`](./
 The workflow builds and runs [`examples/example.c`](./examples/example.c) and CPU/graph tests with Clang and GCC
 under C11 and C++17 AddressSanitizer/UndefinedBehaviorSanitizer, checks separate
 implementation linkage, allocator/async lifetime regressions, and heterogeneous
-`worker_claim` fairness plus ordinary graph ownership/dependency snapshot
-regressions, cross-builds MinGW-w64 x86-64 Windows artifacts, and runs the
-example plus public client and regression suite with MSVC on
+`worker_claim` fairness plus ordinary graph ownership/dependency/snapshot and
+async metadata regressions, cross-builds MinGW-w64 x86-64 Windows artifacts,
+and runs the example plus public client and regression suite with MSVC on
 `windows-latest`.
 
 > [!WARNING]
