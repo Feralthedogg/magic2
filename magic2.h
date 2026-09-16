@@ -912,7 +912,11 @@ typedef struct magic2_adaptive_buffer_config {
     uint32_t reserved_async;
 } magic2_adaptive_buffer_config;
 
-/** @brief Separate runtime, implementation, and selection results for a buffer call. */
+/**
+ * @brief Separate runtime, implementation, and selection results for a buffer call.
+ *
+ * Keep it disjoint from every caller buffer passed to the call.
+ */
 typedef struct magic2_run_status {
     uint32_t struct_size; /**< Size of this descriptor in bytes. */
     uint32_t tag;         /**< Semantic descriptor-family tag. */
@@ -14298,15 +14302,81 @@ static int magic2_internal_graph_metadata_overlap(
     return MAGIC2_OK;
 }
 
-/* Async copy-back requires metadata to be disjoint from caller buffers. */
+/* Scan valid external bindings before graph preparation can report another
+ * error and write a failure status. */
+static int magic2_internal_graph_binding_metadata_overlap(
+    const magic2_graph *graph, const magic2_graph_binding *bindings,
+    size_t binding_count, const void *metadata, size_t metadata_bytes) {
+    const size_t binding_min_size =
+        offsetof(magic2_graph_binding, bytes) +
+        sizeof(((magic2_graph_binding *)0)->bytes);
+    size_t index;
+    int invalid = 0;
+    int overlap;
+    int result;
+    if (metadata == NULL) return MAGIC2_OK;
+    if (bindings == NULL && binding_count != 0u) return MAGIC2_EINVAL;
+    for (index = 0u; index < binding_count; ++index) {
+        const magic2_graph_binding *binding = &bindings[index];
+        const struct magic2_internal_graph_value *value;
+        if (binding->tag != MAGIC2_TAG_GRAPH ||
+            binding->struct_size < binding_min_size ||
+            binding->value_index >= graph->compiled_value_count) {
+            invalid = 1;
+            continue;
+        }
+        value = &graph->values[binding->value_index];
+        if ((value->flags & MAGIC2_GRAPH_VALUE_EXTERNAL) == 0u ||
+            binding->data == NULL || binding->bytes < value->bytes) {
+            invalid = 1;
+            continue;
+        }
+        result = magic2_internal_graph_memory_overlap(
+            metadata, metadata_bytes, binding->data, value->bytes,
+            &overlap);
+        if (result != MAGIC2_OK) {
+            invalid = 1;
+            continue;
+        }
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    return invalid != 0 ? MAGIC2_EINVAL : MAGIC2_OK;
+}
+
+/* Scan caller spans for an overlap with one metadata object. */
+static int magic2_internal_buffer_span_metadata_overlap(
+    const magic2_buffer_desc *buffers, size_t buffer_count,
+    const void *metadata, size_t metadata_bytes) {
+    size_t index;
+    int invalid = 0;
+    int overlap;
+    int result;
+    if (metadata == NULL) return MAGIC2_OK;
+    if (buffers == NULL || buffer_count == 0u ||
+        buffer_count > MAGIC2_MAX_BUFFERS) return MAGIC2_EINVAL;
+    for (index = 0u; index < buffer_count; ++index) {
+        if (buffers[index].data == NULL || buffers[index].bytes == 0u) {
+            invalid = 1;
+            continue;
+        }
+        result = magic2_internal_graph_memory_overlap(
+            metadata, metadata_bytes, buffers[index].data,
+            buffers[index].bytes, &overlap);
+        if (result != MAGIC2_OK) {
+            invalid = 1;
+            continue;
+        }
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    return invalid != 0 ? MAGIC2_EINVAL : MAGIC2_OK;
+}
+
+/* Async copy-back keeps caller buffers separate from handle and status. */
 static int magic2_internal_buffer_metadata_overlap(
     const magic2_buffer_desc *buffers, size_t buffer_count,
     const void *handle, const void *status) {
-    size_t index;
     int overlap;
     int result;
-    if (buffers == NULL || buffer_count == 0u ||
-        buffer_count > MAGIC2_MAX_BUFFERS) return MAGIC2_EINVAL;
     if (handle != NULL && status != NULL) {
         result = magic2_internal_graph_memory_overlap(
             handle, sizeof(magic2_async_handle),
@@ -14314,25 +14384,11 @@ static int magic2_internal_buffer_metadata_overlap(
         if (result != MAGIC2_OK) return result;
         if (overlap) return MAGIC2_EOVERLAP;
     }
-    for (index = 0u; index < buffer_count; ++index) {
-        if (buffers[index].data == NULL || buffers[index].bytes == 0u)
-            return MAGIC2_EINVAL;
-        if (handle != NULL) {
-            result = magic2_internal_graph_memory_overlap(
-                handle, sizeof(magic2_async_handle),
-                buffers[index].data, buffers[index].bytes, &overlap);
-            if (result != MAGIC2_OK) return result;
-            if (overlap) return MAGIC2_EOVERLAP;
-        }
-        if (status != NULL) {
-            result = magic2_internal_graph_memory_overlap(
-                status, sizeof(magic2_async_status),
-                buffers[index].data, buffers[index].bytes, &overlap);
-            if (result != MAGIC2_OK) return result;
-            if (overlap) return MAGIC2_EOVERLAP;
-        }
-    }
-    return MAGIC2_OK;
+    result = magic2_internal_buffer_span_metadata_overlap(
+        buffers, buffer_count, handle, sizeof(magic2_async_handle));
+    if (result != MAGIC2_OK) return result;
+    return magic2_internal_buffer_span_metadata_overlap(
+        buffers, buffer_count, status, sizeof(magic2_async_status));
 }
 
 static int magic2_internal_graph_zero_first_use(
@@ -14464,6 +14520,14 @@ static int magic2_graph_run(
     if (bindings == NULL && binding_count != 0u) return MAGIC2_EINVAL;
     result = magic2_internal_graph_execution_acquire(graph);
     if (result != MAGIC2_OK) return result;
+    if (status != NULL && bindings != NULL && binding_count != 0u) {
+        result = magic2_internal_graph_binding_metadata_overlap(
+            graph, bindings, binding_count, status, sizeof(*status));
+        if (result == MAGIC2_EOVERLAP) {
+            magic2_internal_graph_execution_release(graph);
+            return result;
+        }
+    }
     if (status != NULL && scratch != NULL && graph->scratch_bytes != 0u) {
         result = magic2_internal_graph_memory_overlap(
             status, sizeof(*status), scratch, graph->scratch_bytes,
@@ -16058,11 +16122,22 @@ static int magic2_buffer_context_run(
     magic2_call adaptive_call = MAGIC2_CALL_INIT;
     magic2_stats stats = MAGIC2_STATS_INIT;
     int implementation_status = 0;
+    int metadata_safe = 1;
     int result;
     uint32_t index;
     if (status != NULL &&
         (status->tag != MAGIC2_TAG_BUFFERS ||
          status->struct_size < status_min_size)) return MAGIC2_EABI;
+    if (call != NULL && call->buffers != NULL && call->buffer_count != 0u &&
+        call->buffer_count <= MAGIC2_MAX_BUFFERS) {
+        result = magic2_internal_buffer_span_metadata_overlap(
+            call->buffers, call->buffer_count, status,
+            sizeof(magic2_run_status));
+        if (result == MAGIC2_EOVERLAP) return result;
+        if (result != MAGIC2_OK) metadata_safe = 0;
+    } else if (call != NULL && call->buffer_count > MAGIC2_MAX_BUFFERS) {
+        metadata_safe = 0;
+    }
     if (magic2_internal_callback_active_for(context != NULL ? context->adaptive : NULL))
         return MAGIC2_EREENTRANT;
     result = magic2_internal_buffers_context_acquire(context);
@@ -16070,9 +16145,15 @@ static int magic2_buffer_context_run(
     result = magic2_internal_buffers_acquire_session(context, &session);
     if (result == MAGIC2_OK)
         result = magic2_internal_buffers_prepare_call(context, session, call, &adaptive_call);
+    if (result == MAGIC2_OK) {
+        result = magic2_internal_buffer_span_metadata_overlap(
+            call->buffers, call->buffer_count, status,
+            sizeof(magic2_run_status));
+        if (result != MAGIC2_OK) metadata_safe = 0;
+    }
     if (result == MAGIC2_OK)
         result = magic2_run(context->adaptive, &adaptive_call, &implementation_status);
-    if (status != NULL) {
+    if (status != NULL && metadata_safe) {
         magic2_run_status snapshot = magic2_run_status_initializer();
         snapshot.implementation_status = implementation_status;
         *status = snapshot;

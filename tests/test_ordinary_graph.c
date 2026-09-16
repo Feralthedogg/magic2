@@ -488,11 +488,51 @@ static void test_external_scratch_alias(void) {
     assert(dispatch_graph_destroy(&graph, MAGIC2_DESTROY_TRY) == MAGIC2_OK);
 }
 
+static void test_status_external_binding_error(void) {
+    magic2_graph *graph = make_graph(1u, 2u, 2u);
+    magic2_graph_value_desc value =
+        value_desc(MAGIC2_GRAPH_VALUE_EXTERNAL);
+    magic2_graph_port ports[2];
+    magic2_graph_node_desc node;
+    magic2_graph_info info = MAGIC2_GRAPH_INFO_INIT;
+    magic2_graph_binding binding = MAGIC2_GRAPH_BINDING_INIT;
+    magic2_graph_run_status status = MAGIC2_GRAPH_RUN_STATUS_INIT;
+    union {
+        uintptr_t alignment;
+        unsigned char bytes[128];
+    } storage;
+    uint32_t input_index;
+    uint32_t output_index;
+    uint32_t node_index;
+
+    assert(dispatch_graph_add_value(graph, &value, &input_index) == MAGIC2_OK);
+    assert(dispatch_graph_add_value(graph, &value, &output_index) == MAGIC2_OK);
+    ports[0] = port_desc(input_index, MAGIC2_BUFFER_READ);
+    ports[1] = port_desc(output_index, MAGIC2_BUFFER_WRITE);
+    node = callback_node(ports, 2u);
+    node.callback = graph_noop;
+    assert(dispatch_graph_add_node(graph, &node, &node_index) == MAGIC2_OK);
+    assert(dispatch_graph_compile(graph, &info) == MAGIC2_OK);
+
+    *(magic2_graph_run_status *)(void *)storage.bytes = status;
+    binding.value_index = input_index;
+    binding.data = storage.bytes;
+    binding.bytes = 8u;
+    assert(dispatch_graph_run(
+        graph, &binding, 1u, NULL, 0u,
+        (magic2_graph_run_status *)(void *)storage.bytes) ==
+        MAGIC2_EOVERLAP);
+    assert(((magic2_graph_run_status *)(void *)storage.bytes)->state ==
+        MAGIC2_GRAPH_IDLE);
+    assert(dispatch_graph_destroy(&graph, MAGIC2_DESTROY_TRY) == MAGIC2_OK);
+}
+
 int main(void) {
     test_context_lifetime_retention();
     test_self_read_dependency();
     test_compiled_info_snapshot();
     test_external_scratch_alias();
+    test_status_external_binding_error();
     puts("magic2 ordinary graph regressions passed");
     return 0;
 }

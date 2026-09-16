@@ -35,6 +35,17 @@ static int dispatch_buffer_destroy(
     return magic2(&request);
 }
 
+static int dispatch_buffer_run(
+    magic2_adaptive_buffer_context *context,
+    const magic2_adaptive_buffer_call *call, magic2_run_status *status) {
+    magic2_dispatch_request request = MAGIC2_REQUEST_INIT;
+    request.operation = MAGIC2_OP_BUFFER_CONTEXT_RUN;
+    request.args.buffer_run.context = context;
+    request.args.buffer_run.call = call;
+    request.args.buffer_run.status = status;
+    return magic2(&request);
+}
+
 static int dispatch_buffer_async_submit(
     magic2_adaptive_buffer_context *context,
     const magic2_adaptive_buffer_call *call,
@@ -371,6 +382,7 @@ static void test_direct_buffer_metadata_overlap(void) {
     magic2_buffer_desc buffer = MAGIC2_BUFFER_INIT;
     magic2_async_handle handle = MAGIC2_ASYNC_HANDLE_INIT;
     magic2_async_status status = MAGIC2_ASYNC_STATUS_INIT;
+    magic2_run_status sync_status = MAGIC2_RUN_STATUS_INIT;
     aligned_storage storage;
     aligned_storage output_storage;
     magic2_async_handle *overlap_handle;
@@ -384,6 +396,11 @@ static void test_direct_buffer_metadata_overlap(void) {
     call.buffers = &buffer;
     call.buffer_count = 1u;
     call.count = 8u;
+
+    *(magic2_run_status *)(void *)storage.bytes = sync_status;
+    assert(dispatch_buffer_run(
+        context, &call, (magic2_run_status *)(void *)storage.bytes) ==
+        MAGIC2_EOVERLAP);
 
     overlap_handle = (magic2_async_handle *)(void *)storage.bytes;
     *overlap_handle = MAGIC2_ASYNC_HANDLE_INIT;

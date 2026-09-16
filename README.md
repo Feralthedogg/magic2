@@ -283,6 +283,9 @@ the owning `magic2_async_handle` and `magic2_async_status` must be disjoint from
 all buffer spans.  Submit, poll, wait, cancel, and release reject an overlap
 before backend callbacks or copy-back can damage the operation capability.
 
+`magic2_run_status` follows the same rule for synchronous buffer calls; its
+write occurs only after the buffer metadata has been checked.
+
 For the same reason, external graph bindings must not overlap the graph's
 internal scratch arena.  `magic2_graph_run` and graph async submit reject that
 alias before any node executes; distinct external bindings remain governed by
