@@ -305,6 +305,12 @@ child and turns metadata aliases into `MAGIC2_EOVERLAP` before the batch runs.
 
 Profile export also checks `actual_size` against the serialized output span
 before publishing the required size or writing the `M2PROF` envelope.
+Profile import applies the reciprocal rule to `imported_entries` and its
+read-only input span; the extended import result follows the same contract.
+
+Diagnostic draining checks the event array, `actual_count`, and
+`dropped_count` as one metadata group before consuming the ring, so an output
+alias returns `MAGIC2_EOVERLAP` without changing an event or counter.
 
 For the same reason, external graph bindings must not overlap the graph's
 internal scratch arena.  `magic2_graph_run` and graph async submit reject that

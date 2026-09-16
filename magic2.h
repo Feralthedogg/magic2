@@ -1940,19 +1940,19 @@ typedef union magic2_dispatch_arguments {
         magic2_adaptive_context *context;
         void *buffer;
         size_t capacity;
-        size_t *actual_size;
+        size_t *actual_size; /**< Disjoint from the serialized output span. */
     } adaptive_profile_export;
     struct {
         magic2_adaptive_context *context;
         const void *buffer;
         size_t size;
-        size_t *imported_entries;
+        size_t *imported_entries; /**< Disjoint from the input span. */
     } adaptive_profile_import;
     struct {
         magic2_adaptive_context *context;
         const void *buffer;
         size_t size;
-        magic2_import_result *result;
+        magic2_import_result *result; /**< Disjoint from the input span. */
     } adaptive_profile_import_ex;
     struct {
         magic2_adaptive_context *context;
@@ -1965,8 +1965,8 @@ typedef union magic2_dispatch_arguments {
         magic2_adaptive_context *context;
         magic2_diagnostic_event *events;
         size_t capacity;
-        size_t *actual_count;
-        uint64_t *dropped_count;
+        size_t *actual_count; /**< Disjoint from events and dropped_count. */
+        uint64_t *dropped_count; /**< Disjoint from events and actual_count. */
     } adaptive_diagnostic_drain;
     struct {
         magic2_adaptive_context *context;
@@ -11890,9 +11890,16 @@ static int magic2_profile_import_ex(magic2_adaptive_context *context,
     size_t new_count = 0u;
     size_t eviction_count = 0u;
     struct magic2_internal_import_stage *stages = NULL;
+    int overlap;
     int result;
 
     if (magic2_internal_callback_active_for(context)) return MAGIC2_EREENTRANT;
+    if (buffer != NULL && size != 0u && import_result != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            import_result, sizeof(*import_result), buffer, size, &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
     if (import_result != NULL) {
         if (import_result->tag != MAGIC2_TAG_PROFILE ||
             import_result->struct_size < import_result_min_size) {
@@ -12224,7 +12231,16 @@ magic2_internal_import_finish:
 static int magic2_profile_import(magic2_adaptive_context *context, const void *buffer,
                                    size_t size, size_t *imported_entries) {
     magic2_import_result result_info = magic2_import_result_initializer();
-    const int result = magic2_profile_import_ex(
+    int overlap;
+    int result;
+    if (buffer != NULL && size != 0u && imported_entries != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            imported_entries, sizeof(*imported_entries), buffer, size,
+            &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
+    result = magic2_profile_import_ex(
         context, buffer, size, &result_info);
     if (imported_entries != NULL)
         *imported_entries = result_info.imported_entries;
@@ -12333,12 +12349,37 @@ static int magic2_profile_store(magic2_adaptive_context *context) {
 static int magic2_diagnostic_drain(
     magic2_adaptive_context *context, magic2_diagnostic_event *events, size_t capacity,
     size_t *actual_count, uint64_t *dropped_count) {
+    size_t events_bytes;
     size_t available;
     size_t copied;
     size_t index;
+    int overlap;
     int result;
     if (actual_count == NULL || (capacity != 0u && events == NULL))
         return MAGIC2_EINVAL;
+    if (!magic2_internal_size_mul(
+            capacity, sizeof(*events), &events_bytes)) return MAGIC2_EINVAL;
+    if (events_bytes != 0u) {
+        result = magic2_internal_graph_memory_overlap(
+            actual_count, sizeof(*actual_count), events, events_bytes,
+            &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+        if (dropped_count != NULL) {
+            result = magic2_internal_graph_memory_overlap(
+                dropped_count, sizeof(*dropped_count), events, events_bytes,
+                &overlap);
+            if (result != MAGIC2_OK) return result;
+            if (overlap) return MAGIC2_EOVERLAP;
+        }
+    }
+    if (dropped_count != NULL) {
+        result = magic2_internal_graph_memory_overlap(
+            actual_count, sizeof(*actual_count), dropped_count,
+            sizeof(*dropped_count), &overlap);
+        if (result != MAGIC2_OK) return result;
+        if (overlap) return MAGIC2_EOVERLAP;
+    }
     *actual_count = 0u;
     result = magic2_internal_context_acquire(context);
     if (result != MAGIC2_OK) return result;
@@ -14362,6 +14403,8 @@ static int magic2_internal_graph_binding_metadata_overlap(
 static int magic2_internal_buffer_span_metadata_overlap(
     const magic2_buffer_desc *buffers, size_t buffer_count,
     const void *metadata, size_t metadata_bytes) {
+    const size_t buffer_min_size = offsetof(magic2_buffer_desc, flags) +
+        sizeof(((magic2_buffer_desc *)0)->flags);
     size_t index;
     int invalid = 0;
     int overlap;
@@ -14370,6 +14413,8 @@ static int magic2_internal_buffer_span_metadata_overlap(
     if (buffers == NULL || buffer_count == 0u ||
         buffer_count > MAGIC2_MAX_BUFFERS) return MAGIC2_EINVAL;
     for (index = 0u; index < buffer_count; ++index) {
+        if (buffers[index].struct_size < buffer_min_size)
+            return MAGIC2_EABI;
         if (buffers[index].data == NULL || buffers[index].bytes == 0u) {
             invalid = 1;
             continue;
@@ -14404,6 +14449,33 @@ static int magic2_internal_buffer_metadata_overlap(
     if (result != MAGIC2_OK) return result;
     return magic2_internal_buffer_span_metadata_overlap(
         buffers, buffer_count, status, sizeof(magic2_async_status));
+}
+
+/* Read only the fixed header before any variable-size call fields. */
+static int magic2_internal_adaptive_call_header_valid(
+    const magic2_call *call) {
+    const size_t tag_size = offsetof(magic2_call, tag) +
+        sizeof(((magic2_call *)0)->tag);
+    const size_t call_min_size = offsetof(magic2_call, user) +
+        sizeof(((magic2_call *)0)->user);
+    if (call == NULL) return MAGIC2_EABI;
+    if (call->struct_size < tag_size) return MAGIC2_EABI;
+    if (call->tag != MAGIC2_TAG_ADAPTIVE ||
+        call->struct_size < call_min_size) return MAGIC2_EABI;
+    return MAGIC2_OK;
+}
+
+static int magic2_internal_adaptive_buffer_call_header_valid(
+    const magic2_adaptive_buffer_call *call) {
+    const size_t tag_size = offsetof(magic2_adaptive_buffer_call, tag) +
+        sizeof(((magic2_adaptive_buffer_call *)0)->tag);
+    const size_t call_min_size = offsetof(magic2_adaptive_buffer_call, user) +
+        sizeof(((magic2_adaptive_buffer_call *)0)->user);
+    if (call == NULL) return MAGIC2_EABI;
+    if (call->struct_size < tag_size) return MAGIC2_EABI;
+    if (call->tag != MAGIC2_TAG_BUFFERS ||
+        call->struct_size < call_min_size) return MAGIC2_EABI;
+    return MAGIC2_OK;
 }
 
 /* Tuner wrappers write caller metadata only after proving that it cannot
@@ -14492,7 +14564,8 @@ static int magic2_internal_adaptive_buffer_status_overlap(
     int overlap;
     int result;
     if (status == NULL) return MAGIC2_OK;
-    if (call == NULL) return MAGIC2_EINVAL;
+    result = magic2_internal_adaptive_buffer_call_header_valid(call);
+    if (result != MAGIC2_OK) return result;
     result = magic2_internal_graph_memory_overlap(
         status, sizeof(magic2_run_status), call, sizeof(*call), &overlap);
     if (result != MAGIC2_OK) return result;
@@ -16683,6 +16756,13 @@ static int magic2_buffer_async_submit(
     if (context->async_operation_capacity == 0u) {
         magic2_internal_buffers_context_release(context);
         return MAGIC2_EUNSUPPORTED;
+    }
+    if (call != NULL) {
+        result = magic2_internal_adaptive_buffer_call_header_valid(call);
+        if (result != MAGIC2_OK) {
+            magic2_internal_buffers_context_release(context);
+            return result;
+        }
     }
     /* Check before reaping; quarantine cleanup may copy into caller buffers. */
     if (call != NULL && call->buffers != NULL && call->buffer_count != 0u &&
@@ -26220,6 +26300,8 @@ static int magic2_internal_dispatch_batch_pair_call_overlap(
     size_t metadata_count) {
     int result;
     if (call == NULL) return MAGIC2_OK;
+    result = magic2_internal_adaptive_call_header_valid(call);
+    if (result != MAGIC2_OK) return result;
     result = magic2_internal_dispatch_batch_check_span(
         call, sizeof(*call), metadata, metadata_count);
     if (result != MAGIC2_OK) return result;
@@ -26255,10 +26337,14 @@ static int magic2_internal_dispatch_batch_buffer_call_overlap(
     const magic2_adaptive_buffer_call *call,
     const struct magic2_internal_dispatch_span *metadata,
     size_t metadata_count) {
+    const size_t buffer_min_size = offsetof(magic2_buffer_desc, flags) +
+        sizeof(((magic2_buffer_desc *)0)->flags);
     size_t descriptors_bytes;
     size_t index;
     int result;
     if (call == NULL) return MAGIC2_OK;
+    result = magic2_internal_adaptive_buffer_call_header_valid(call);
+    if (result != MAGIC2_OK) return result;
     result = magic2_internal_dispatch_batch_check_span(
         call, sizeof(*call), metadata, metadata_count);
     if (result != MAGIC2_OK) return result;
@@ -26270,6 +26356,8 @@ static int magic2_internal_dispatch_batch_buffer_call_overlap(
         call->buffers, descriptors_bytes, metadata, metadata_count);
     if (result != MAGIC2_OK) return result;
     for (index = 0u; index < call->buffer_count; ++index) {
+        if (call->buffers[index].struct_size < buffer_min_size)
+            return MAGIC2_EABI;
         result = magic2_internal_dispatch_batch_check_span(
             call->buffers[index].data, call->buffers[index].bytes,
             metadata, metadata_count);
@@ -26282,6 +26370,10 @@ static int magic2_internal_dispatch_batch_graph_bindings_overlap(
     const magic2_graph_binding *bindings, size_t binding_count,
     const struct magic2_internal_dispatch_span *metadata,
     size_t metadata_count) {
+    const size_t binding_tag_size = offsetof(magic2_graph_binding, tag) +
+        sizeof(((magic2_graph_binding *)0)->tag);
+    const size_t binding_min_size = offsetof(magic2_graph_binding, bytes) +
+        sizeof(((magic2_graph_binding *)0)->bytes);
     size_t bindings_bytes;
     size_t index;
     int result;
@@ -26293,6 +26385,10 @@ static int magic2_internal_dispatch_batch_graph_bindings_overlap(
         bindings, bindings_bytes, metadata, metadata_count);
     if (result != MAGIC2_OK) return result;
     for (index = 0u; index < binding_count; ++index) {
+        if (bindings[index].struct_size < binding_tag_size ||
+            bindings[index].tag != MAGIC2_TAG_GRAPH ||
+            bindings[index].struct_size < binding_min_size)
+            return MAGIC2_EABI;
         result = magic2_internal_dispatch_batch_check_span(
             bindings[index].data, bindings[index].bytes,
             metadata, metadata_count);
@@ -26312,8 +26408,11 @@ static int magic2_internal_dispatch_batch_child_overlap(
     if (child == NULL) return MAGIC2_EINVAL;
     result = magic2_internal_validate_any_envelope(child, depth + 1u);
     if (result != MAGIC2_OK) return result;
+    /* The child envelope is itself the object being inspected, so compare it
+     * with the four batch-owned spans first.  Its own control span is added
+     * to metadata for all nested payload checks below. */
     result = magic2_internal_dispatch_batch_check_span(
-        child, sizeof(*child), metadata, metadata_count);
+        child, sizeof(*child), metadata, 4u);
     if (result != MAGIC2_OK) return result;
     switch (child->operation) {
         case MAGIC2_OP_GET_CAPABILITIES:
@@ -26548,14 +26647,17 @@ static int magic2_internal_dispatch_batch(
     int *results = request->args.batch.results;
     size_t *processed_count = request->args.batch.processed_count;
     const uint32_t flags = request->args.batch.flags;
-    struct magic2_internal_dispatch_span metadata[4];
+    struct magic2_internal_dispatch_span *metadata = NULL;
     void **request_snapshot = NULL;
     int *result_snapshot = NULL;
     size_t request_bytes;
     size_t result_bytes;
     size_t envelope_bytes;
+    size_t metadata_count;
+    size_t metadata_bytes;
     size_t processed = 0u;
     int first_error = MAGIC2_OK;
+    int overlap;
     int result;
     size_t index;
 
@@ -26567,6 +26669,10 @@ static int magic2_internal_dispatch_batch(
                                   &result_bytes)) {
         return MAGIC2_EINVAL;
     }
+    if (!magic2_internal_size_add(4u, request_count, &metadata_count) ||
+        !magic2_internal_size_mul(
+            metadata_count, sizeof(*metadata), &metadata_bytes))
+        return MAGIC2_EINVAL;
     envelope_bytes = offsetof(magic2_dispatch_request, args) +
         sizeof(((magic2_dispatch_request *)0)->args.batch);
     if (request_count != 0u) {
@@ -26583,6 +26689,12 @@ static int magic2_internal_dispatch_batch(
         for (index = 0u; index < request_count; ++index)
             result_snapshot[index] = MAGIC2_ENOTPROCESSED;
     }
+    metadata = (struct magic2_internal_dispatch_span *)malloc(metadata_bytes);
+    if (metadata == NULL) {
+        free(result_snapshot);
+        free(request_snapshot);
+        return MAGIC2_ENOMEM;
+    }
     metadata[0].pointer = requests;
     metadata[0].bytes = request_bytes;
     metadata[1].pointer = results;
@@ -26592,10 +26704,38 @@ static int magic2_internal_dispatch_batch(
     metadata[3].pointer = request;
     metadata[3].bytes = envelope_bytes;
     for (index = 0u; index < request_count; ++index) {
+        metadata[4u + index].pointer = request_snapshot[index];
+        metadata[4u + index].bytes = sizeof(magic2_dispatch_request);
+    }
+    for (index = 0u; index < request_count; ++index) {
+        size_t other;
+        for (other = index + 1u; other < request_count; ++other) {
+            result = magic2_internal_graph_memory_overlap(
+                metadata[4u + index].pointer,
+                metadata[4u + index].bytes,
+                metadata[4u + other].pointer,
+                metadata[4u + other].bytes,
+                &overlap);
+            if (result != MAGIC2_OK) {
+                free(metadata);
+                free(result_snapshot);
+                free(request_snapshot);
+                return result;
+            }
+            if (overlap) {
+                free(metadata);
+                free(result_snapshot);
+                free(request_snapshot);
+                return MAGIC2_EOVERLAP;
+            }
+        }
+    }
+    for (index = 0u; index < request_count; ++index) {
         result = magic2_internal_dispatch_batch_child_overlap(
             (const magic2_dispatch_request *)request_snapshot[index],
-            depth, metadata, 4u);
+            depth, metadata, metadata_count);
         if (result != MAGIC2_OK) {
+            free(metadata);
             free(result_snapshot);
             free(request_snapshot);
             return result;
@@ -26628,6 +26768,7 @@ magic2_dispatch_batch_finish:
         memcpy(results, result_snapshot, result_bytes);
     if (processed_count != NULL) *processed_count = processed;
     request->implementation_status = 0;
+    free(metadata);
     free(result_snapshot);
     free(request_snapshot);
     return first_error;
