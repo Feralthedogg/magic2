@@ -62,6 +62,24 @@ static void fairness_sleep_ms(uint32_t milliseconds) {
 #endif
 }
 
+static void fairness_started_store(fairness_shared *shared, uint32_t value) {
+#if defined(_WIN32)
+    (void)InterlockedExchange(
+        (volatile LONG *)&shared->a_started, (LONG)value);
+#else
+    __atomic_store_n(&shared->a_started, value, __ATOMIC_RELEASE);
+#endif
+}
+
+static uint32_t fairness_started_load(const fairness_shared *shared) {
+#if defined(_WIN32)
+    return (uint32_t)InterlockedCompareExchange(
+        (volatile LONG *)&shared->a_started, 0, 0);
+#else
+    return __atomic_load_n(&shared->a_started, __ATOMIC_ACQUIRE);
+#endif
+}
+
 static int fairness_kernel(
     const void *opaque, void *const *ports, size_t count, void *scratch) {
     const fairness_environment *environment =
@@ -71,14 +89,15 @@ static int fairness_kernel(
     assert(count == 1u);
     assert(ports != NULL && ports[1] != NULL);
     if (environment->role == FAIRNESS_A) {
-        shared->a_started = 1u;
+        fairness_started_store(shared, 1u);
         fairness_sleep_ms(20u);
         shared->a_finished_ns = fairness_now_ns();
     } else if (environment->role == FAIRNESS_PREDECESSOR) {
         const uint64_t deadline = fairness_now_ns() + UINT64_C(1000000000);
-        while (shared->a_started == 0u && fairness_now_ns() < deadline)
+        while (fairness_started_load(shared) == 0u &&
+               fairness_now_ns() < deadline)
             fairness_sleep_ms(1u);
-        assert(shared->a_started != 0u);
+        assert(fairness_started_load(shared) != 0u);
     } else if (environment->role == FAIRNESS_B) {
         fairness_sleep_ms(1u);
     } else {

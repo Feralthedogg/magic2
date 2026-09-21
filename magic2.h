@@ -23017,6 +23017,7 @@ struct magic2_internal_cpu_evidence {
 
 struct magic2_cpu_family {
     uint64_t cookie;
+    void *self_allocation;
     struct magic2_internal_lock32 lock;
     uint32_t closing;
     uint32_t active_runs;
@@ -24867,7 +24868,19 @@ MAGIC2_API int magic2_cpu_family_create(
     snapshot = (magic2_cpu_plan **)malloc(plan_count * sizeof(*snapshot));
     if (snapshot == NULL) return MAGIC2_ENOMEM;
     memcpy(snapshot, plans, plan_count * sizeof(*snapshot));
-    family = (magic2_cpu_family *)calloc(1u, sizeof(*family));
+    {
+        void *family_allocation = NULL;
+        result = magic2_internal_allocate_aligned_with(
+            NULL, NULL, sizeof(*family),
+            MAGIC2_INTERNAL_ALIGNOF(magic2_cpu_family), NULL,
+            (void **)&family, &family_allocation);
+        if (result != MAGIC2_OK) {
+            free(snapshot);
+            return result;
+        }
+        memset(family, 0, sizeof(*family));
+        family->self_allocation = family_allocation;
+    }
     if (family == NULL) {
         free(snapshot);
         return MAGIC2_ENOMEM;
@@ -24939,7 +24952,7 @@ magic2_cpu_family_create_fail:
         free(family->bucket_calls);
         free(family->evidence);
         free(family->plans);
-        free(family);
+        magic2_internal_free_with(NULL, family->self_allocation, NULL);
     }
     free(snapshot);
     return result;
@@ -25699,7 +25712,7 @@ MAGIC2_API int magic2_cpu_family_destroy(magic2_cpu_family **pointer) {
     free(family->bucket_calls);
     free(family->evidence);
     free(family->plans);
-    free(family);
+    magic2_internal_free_with(NULL, family->self_allocation, NULL);
     return MAGIC2_OK;
 }
 
