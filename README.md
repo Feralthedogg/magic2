@@ -451,8 +451,11 @@ The workflow builds and runs [`examples/example.c`](./examples/example.c) and CP
 under C11 and C++17 AddressSanitizer/UndefinedBehaviorSanitizer, checks separate
 implementation linkage, allocator/async lifetime regressions, and heterogeneous
 `worker_claim` fairness plus ordinary graph ownership/dependency/snapshot and
-async metadata regressions, cross-builds MinGW-w64 x86-64 Windows artifacts,
-and runs the example plus public client and regression suite with MSVC on
+async metadata regressions. A separate Linux sanitizer matrix runs independent
+UBSan, ThreadSanitizer, MemorySanitizer (with origin tracking), and
+LeakSanitizer jobs over the same C11/C++17 suite and implementation-linkage
+checks. The workflow also cross-builds MinGW-w64 x86-64 Windows artifacts and
+runs the example plus public client and regression suite with MSVC on
 `windows-latest`.
 
 > [!WARNING]
@@ -465,7 +468,7 @@ and runs the example plus public client and regression suite with MSVC on
 The implementation was checked with:
 
 - Clang C11/C++17 ASan and UBSan full regression tests;
-- CPU and graph ThreadSanitizer suites;
+- independent UBSan, TSan, MSan, and LSan C11/C++17 suites in CI;
 - GCC 14.2 Linux amd64 execution under a constrained container;
 - MinGW-w64 x86-64 strict builds and static PE64 execution through Wine;
 - deterministic random-DAG differential tests and profile mutation tests.
