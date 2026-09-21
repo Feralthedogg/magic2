@@ -85,7 +85,7 @@ jobs:
           - name: msan
             compiler: clang
             cxx: clang++
-            flags: -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -fPIE -pie
+            flags: -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -fPIE -pie -Wno-unused-command-line-argument
             runtime: MSAN_OPTIONS=halt_on_error=1:exit_code=1:print_stacktrace=1
           - name: lsan
             compiler: clang
